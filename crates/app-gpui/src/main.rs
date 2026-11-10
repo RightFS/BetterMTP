@@ -1,8 +1,9 @@
-//! Read-only local and worker-backed remote browsing with viewport-virtualized rows.
-//! No transfer, write, delete, or simulated device UI is implemented.
+//! Local and worker-backed browsing with capability-gated single-file transfers.
+//! No recursive transfer, delete, overwrite, or simulated device operations.
 
 mod local;
 mod remote;
+mod transfers;
 
 use std::path::PathBuf;
 
@@ -14,6 +15,7 @@ use gpui::{
 use local::LocalBrowser;
 use mtp_local_fs::{EntryKind, read_directory};
 use remote::{RemoteBrowser, RemoteCommand, RemoteConfig, RemoteLocation};
+use transfers::{TransferPlan, TransferState};
 
 actions!(
     mtp,
@@ -36,6 +38,7 @@ struct MtpShell {
     scroll: UniformListScrollHandle,
     remote: RemoteBrowser,
     remote_scroll: UniformListScrollHandle,
+    transfer: TransferState,
 }
 
 fn toolbar_button(id: &'static str, label: &'static str) -> Stateful<Div> {
@@ -65,10 +68,12 @@ impl MtpShell {
     fn new(
         path: PathBuf,
         remote_config: RemoteConfig,
+        cache: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut shell = Self::state(path.clone(), remote_config, window, cx);
+        shell.transfer.cache = cache;
         shell.request_directory(path, cx);
         shell
     }
@@ -81,7 +86,7 @@ impl MtpShell {
     ) -> Self {
         let local_focus = cx.focus_handle().tab_index(1).tab_stop(true);
         local_focus.focus(window);
-        Self {
+        let shell = Self {
             focus_handle: cx.focus_handle(),
             local_focus,
             remote_focus: cx.focus_handle().tab_index(2).tab_stop(true),
@@ -89,7 +94,16 @@ impl MtpShell {
             scroll: UniformListScrollHandle::new(),
             remote: RemoteBrowser::new(remote_config),
             remote_scroll: UniformListScrollHandle::new(),
-        }
+            transfer: TransferState::new(None),
+        };
+        cx.on_release(|this, _| this.remote.shared.request_stop())
+            .detach();
+        cx.on_app_quit(|this, _| {
+            this.remote.shared.request_stop();
+            async {}
+        })
+        .detach();
+        shell
     }
 
     /// Called at startup or by events only. Render never starts filesystem work.
@@ -185,7 +199,7 @@ impl MtpShell {
                     )
                 }
             })
-            .unwrap_or_else(|| "只读浏览 · 不打开文件，不跟随符号链接，不执行传输".into());
+            .unwrap_or_else(|| "浏览不打开文件、不跟随链接；单文件传输须显式点击".into());
 
         div()
             .id("local-pane")
@@ -218,7 +232,7 @@ impl MtpShell {
                     .p_4()
                     .border_b_1()
                     .border_color(rgb(0x30394a))
-                    .child(div().text_lg().child("本地 / Local · 只读"))
+                    .child(div().text_lg().child("本地 / Local · 浏览"))
                     .child(
                         div()
                             .text_sm()
@@ -394,6 +408,9 @@ impl MtpShell {
     }
 
     fn request_remote(&mut self, command: RemoteCommand, cx: &mut Context<Self>) {
+        if !self.transfer.remote_requests_allowed() {
+            return;
+        }
         let Some(revision) = self.remote.begin(&command) else {
             cx.notify();
             return;
@@ -418,6 +435,9 @@ impl MtpShell {
     }
 
     fn connect_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.transfer.remote_requests_allowed() {
+            return;
+        }
         self.remote_focus.focus(window);
         if !self.remote.loading && matches!(&self.remote.config, RemoteConfig::Ready { .. }) {
             self.request_remote(RemoteCommand::Connect(self.remote.config.clone()), cx);
@@ -425,18 +445,27 @@ impl MtpShell {
     }
 
     fn disconnect_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.transfer.remote_requests_allowed() {
+            return;
+        }
         self.remote_focus.focus(window);
         // begin clears every remote reference synchronously, even during connect/list.
         self.request_remote(RemoteCommand::Disconnect, cx);
     }
 
     fn refresh_remote(&mut self, _: &RefreshRemote, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.transfer.remote_requests_allowed() {
+            return;
+        }
         if let Some(directory) = self.remote.current().cloned() {
             self.request_remote(RemoteCommand::List(directory), cx);
         }
     }
 
     fn parent_remote(&mut self, _: &ParentRemote, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.transfer.remote_requests_allowed() {
+            return;
+        }
         if self.remote.locations.len() > 1 {
             self.remote.locations.pop();
             if let Some(directory) = self.remote.current().cloned() {
@@ -446,6 +475,9 @@ impl MtpShell {
     }
 
     fn select_storage(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.transfer.remote_requests_allowed() {
+            return;
+        }
         self.remote_focus.focus(window);
         if let Some(root) = self.remote.root_location(index) {
             let directory = root.directory.clone();
@@ -455,6 +487,9 @@ impl MtpShell {
     }
 
     fn root_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.transfer.remote_requests_allowed() {
+            return;
+        }
         let index = self.remote.current().and_then(|directory| {
             self.remote
                 .storages
@@ -473,6 +508,9 @@ impl MtpShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.transfer.remote_requests_allowed() {
+            return;
+        }
         self.remote_focus.focus(window);
         let Some(entry) = self.remote.entries.get(index) else {
             return;
@@ -493,6 +531,271 @@ impl MtpShell {
         }
     }
 
+    fn upload_plan(&self) -> Result<TransferPlan, &'static str> {
+        if !self.transfer.remote_requests_allowed() || self.remote.loading {
+            return Err("设备正忙或待核对，不能上传。");
+        }
+        let session = self.remote.session.as_ref().ok_or("请先连接设备。")?;
+        if !session.capabilities.upload {
+            return Err("HELLO 未提供已验证上传能力；此连接仅可浏览。");
+        }
+        let entry = self
+            .local
+            .selected_entry()
+            .ok_or("请先选中一个本地普通文件。");
+        let entry = entry?;
+        let destination = self
+            .remote
+            .current()
+            .cloned()
+            .ok_or("请先选择远端存储或目录。");
+        let destination = destination?;
+        let cache = self
+            .transfer
+            .cache
+            .clone()
+            .ok_or("HOME 不可用，未配置安全传输缓存。");
+        let cache = cache?;
+        TransferPlan::upload(entry, destination, self.remote.address(), cache)
+    }
+
+    fn download_plan(&self) -> Result<TransferPlan, &'static str> {
+        if !self.transfer.remote_requests_allowed() || self.remote.loading {
+            return Err("设备正忙或待核对，不能下载。");
+        }
+        let session = self.remote.session.as_ref().ok_or("请先连接设备。")?;
+        if !session.capabilities.download {
+            return Err("HELLO 未提供已验证下载能力；此连接仅可浏览。");
+        }
+        if self.local.loading || self.local.error.is_some() {
+            return Err("请等待本地目标目录加载成功。");
+        }
+        let entry = self
+            .remote
+            .selected
+            .as_ref()
+            .and_then(|reference| {
+                self.remote
+                    .entries
+                    .iter()
+                    .find(|entry| &entry.reference == reference)
+            })
+            .ok_or("请先选中一个远端普通文件。");
+        let entry = entry?;
+        if entry.directory {
+            return Err("当前仅支持普通文件下载；目录暂不支持，不会递归。");
+        }
+        Ok(TransferPlan::Download {
+            source: entry.reference.clone(),
+            source_name: entry.name.clone(),
+            destination: self.local.path.clone(),
+            policy: self.transfer.download_policy,
+        })
+    }
+
+    fn start_upload(&mut self, cx: &mut Context<Self>) {
+        if self.transfer.busy() || self.transfer.requires_review {
+            return;
+        }
+        match self.upload_plan() {
+            Ok(plan) => self.submit_transfer(plan, cx),
+            Err(message) => {
+                self.transfer.reject(message);
+                cx.notify();
+            }
+        }
+    }
+
+    fn start_download(&mut self, cx: &mut Context<Self>) {
+        if self.transfer.busy() || self.transfer.requires_review {
+            return;
+        }
+        match self.download_plan() {
+            Ok(plan) => self.submit_transfer(plan, cx),
+            Err(message) => {
+                self.transfer.reject(message);
+                cx.notify();
+            }
+        }
+    }
+
+    fn submit_transfer(&mut self, plan: TransferPlan, cx: &mut Context<Self>) {
+        let id = match self.transfer.begin(plan.clone()) {
+            Ok(id) => id,
+            Err(message) => {
+                self.transfer.reject(message);
+                cx.notify();
+                return;
+            }
+        };
+        let epoch = self.remote.transfer_epoch();
+        let shared = self.remote.shared.clone();
+        cx.notify();
+        let task = cx
+            .background_executor()
+            .spawn(async move { remote::run_transfer(shared, epoch, plan) });
+        cx.spawn(async move |this, cx| {
+            let report = task.await;
+            // Not gated by either pane's browse revision: local navigation does
+            // not discard terminal transfer results or the captured destination.
+            let _ = this.update(cx, |this, cx| {
+                if this.transfer.complete(id, report.outcome) {
+                    if !report.session_usable {
+                        this.remote.clear_references();
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn acknowledge_transfer_review(&mut self, cx: &mut Context<Self>) {
+        if self.transfer.acknowledge_review() {
+            self.remote.clear_references();
+            cx.notify();
+        }
+    }
+
+    fn transfer_panel(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let can_upload = self.upload_plan().is_ok();
+        let can_download = self.download_plan().is_ok();
+        let policy = self.transfer.download_policy;
+        let directory_hint = if self
+            .local
+            .selected_entry()
+            .is_some_and(|entry| entry.kind == EntryKind::Directory)
+        {
+            "目录上传暂不支持；不会递归。"
+        } else if self
+            .remote
+            .selected
+            .as_ref()
+            .and_then(|reference| {
+                self.remote
+                    .entries
+                    .iter()
+                    .find(|entry| &entry.reference == reference)
+            })
+            .is_some_and(|entry| entry.directory)
+        {
+            "目录下载暂不支持；不会递归。"
+        } else {
+            "只传选中的单个普通文件 · 上传 KeepBoth 使用实际 crypto-suffix 名称 · 本地浏览可继续"
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_4()
+            .py_2()
+            .bg(rgb(0x141a25))
+            .border_b_1()
+            .border_color(rgb(0x30394a))
+            .text_sm()
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        toolbar_button("upload-file", "上传单文件 →")
+                            .when(!can_upload, |this| this.opacity(0.4))
+                            .on_click(cx.listener(|this, _, _, cx| this.start_upload(cx))),
+                    )
+                    .child(
+                        toolbar_button("download-file", "← 下载单文件")
+                            .when(!can_download, |this| this.opacity(0.4))
+                            .on_click(cx.listener(|this, _, _, cx| this.start_download(cx))),
+                    )
+                    .child(
+                        toolbar_button(
+                            "download-conflict",
+                            match policy {
+                                mtp_backend_api::FileConflictPolicy::KeepBoth => {
+                                    "下载冲突: KeepBoth"
+                                }
+                                mtp_backend_api::FileConflictPolicy::Skip => "下载冲突: Skip",
+                            },
+                        )
+                        .when(!self.transfer.remote_requests_allowed(), |this| {
+                            this.opacity(0.4)
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.transfer.remote_requests_allowed() {
+                                this.transfer.download_policy = match this.transfer.download_policy
+                                {
+                                    mtp_backend_api::FileConflictPolicy::KeepBoth => {
+                                        mtp_backend_api::FileConflictPolicy::Skip
+                                    }
+                                    mtp_backend_api::FileConflictPolicy::Skip => {
+                                        mtp_backend_api::FileConflictPolicy::KeepBoth
+                                    }
+                                };
+                                cx.notify();
+                            }
+                        })),
+                    )
+                    .when(self.transfer.requires_review, |this| {
+                        this.child(
+                            toolbar_button("ack-review", "我已核对，允许重新连接").on_click(
+                                cx.listener(|this, _, _, cx| this.acknowledge_transfer_review(cx)),
+                            ),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .text_color(rgb(if self.transfer.requires_review {
+                        0xe9bc73
+                    } else {
+                        0xb8c5da
+                    }))
+                    .child(self.transfer.summary()),
+            )
+            .child(
+                div()
+                    .text_color(rgb(0x96a3b8))
+                    .text_ellipsis()
+                    .child(directory_hint),
+            )
+            .when_some(self.transfer.target_summary(), |this, target| {
+                this.child(
+                    div()
+                        .text_color(rgb(0x96a3b8))
+                        .text_ellipsis()
+                        .child(target),
+                )
+            })
+            .when_some(self.transfer.published_path(), |this, path| {
+                this.child(
+                    div()
+                        .text_color(rgb(0xb8c5da))
+                        .text_ellipsis()
+                        .child(format!("实际下载文件: {}", path.to_string_lossy())),
+                )
+            })
+            .when(
+                self.transfer.requires_review && self.transfer.journal().is_none(),
+                |this| {
+                    this.child(
+                        div()
+                            .text_color(rgb(0xe9bc73))
+                            .child("Journal 位置未回传；请核对捕获目标与默认缓存，勿自动重试。"),
+                    )
+                },
+            )
+            .when_some(self.transfer.journal(), |this, journal| {
+                this.child(
+                    div()
+                        .text_color(rgb(0xe9bc73))
+                        .text_ellipsis()
+                        .child(format!("Journal 核对证据: {}", journal.to_string_lossy())),
+                )
+            })
+    }
+
     fn remote_panel(
         &self,
         window: &mut Window,
@@ -511,9 +814,16 @@ impl MtpShell {
             "设备错误 · 请查看详情并重连".into()
         } else if connected {
             format!(
-                "已连接 · {} 存储 · {} 项 · 只读",
+                "已连接 · {} 存储 · {} 项 · {}",
                 self.remote.storages.len(),
-                self.remote.entries.len()
+                self.remote.entries.len(),
+                if self.remote.session.as_ref().is_some_and(
+                    |session| session.capabilities.upload || session.capabilities.download
+                ) {
+                    "单文件能力已确认"
+                } else {
+                    "只读浏览"
+                }
             )
         } else {
             self.remote.config.message().into()
@@ -535,10 +845,12 @@ impl MtpShell {
                     entry.name
                 )
             })
-            .unwrap_or_else(|| "单击选择 · 双击目录 · 不执行上传/下载/删除".into());
-        let can_connect =
-            matches!(&self.remote.config, RemoteConfig::Ready { .. }) && !self.remote.loading;
-        let can_disconnect = connected || self.remote.loading;
+            .unwrap_or_else(|| "单击选择 · 双击目录 · 单文件按 HELLO 能力传输 · 不删除".into());
+        let can_connect = matches!(&self.remote.config, RemoteConfig::Ready { .. })
+            && !self.remote.loading
+            && self.transfer.remote_requests_allowed();
+        let can_disconnect =
+            (connected || self.remote.loading) && self.transfer.remote_requests_allowed();
 
         div()
             .id("remote-pane")
@@ -609,7 +921,11 @@ impl MtpShell {
                             )
                             .child(
                                 toolbar_button("refresh-remote", "刷新 ⌘R")
-                                    .when(self.remote.current().is_none(), |this| this.opacity(0.4))
+                                    .when(
+                                        self.remote.current().is_none()
+                                            || !self.transfer.remote_requests_allowed(),
+                                        |this| this.opacity(0.4),
+                                    )
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.remote_focus.focus(window);
                                         this.refresh_remote(&RefreshRemote, window, cx);
@@ -617,7 +933,11 @@ impl MtpShell {
                             )
                             .child(
                                 toolbar_button("parent-remote", "上级 ⌘B")
-                                    .when(self.remote.locations.len() < 2, |this| this.opacity(0.4))
+                                    .when(
+                                        self.remote.locations.len() < 2
+                                            || !self.transfer.remote_requests_allowed(),
+                                        |this| this.opacity(0.4),
+                                    )
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.remote_focus.focus(window);
                                         this.parent_remote(&ParentRemote, window, cx);
@@ -625,7 +945,10 @@ impl MtpShell {
                             )
                             .child(
                                 toolbar_button("root-remote", "根目录")
-                                    .when(!connected, |this| this.opacity(0.4))
+                                    .when(
+                                        !connected || !self.transfer.remote_requests_allowed(),
+                                        |this| this.opacity(0.4),
+                                    )
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.root_remote(window, cx)
                                     })),
@@ -651,6 +974,9 @@ impl MtpShell {
                                         .text_sm()
                                         .bg(rgb(if active { 0x2b446a } else { 0x263245 }))
                                         .cursor_pointer()
+                                        .when(!self.transfer.remote_requests_allowed(), |this| {
+                                            this.opacity(0.4)
+                                        })
                                         .child(storage.name.clone())
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.select_storage(index, window, cx)
@@ -813,14 +1139,15 @@ impl Render for MtpShell {
                     .child(div().text_xl().child("MTP · Native"))
                     .child(div().text_sm().text_color(rgb(0xe9bc73)).child(
                         if self.remote.session.is_some() {
-                            "只读本地 / MTP 目录 · 已连接"
+                            "本地 / MTP 目录 · 已连接"
                         } else if self.remote.loading {
-                            "只读本地 / MTP 目录 · 请求中"
+                            "本地 / MTP 目录 · 请求中"
                         } else {
-                            "只读本地 / MTP 目录 · 未连接"
+                            "本地 / MTP 目录 · 未连接"
                         },
                     )),
             )
+            .child(self.transfer_panel(cx))
             .child(
                 div()
                     .flex()
@@ -843,7 +1170,7 @@ impl Render for MtpShell {
                     .border_color(rgb(0x30394a))
                     .text_sm()
                     .text_color(rgb(0x96a3b8))
-                    .child("只读本地 / 设备浏览 · 无上传下载 / 无删除")
+                    .child("单文件 KeepBoth / Skip · 不覆盖，不递归，不删除")
                     .child("Tab 切换面板 · ⌘Q 退出"),
             )
     }
@@ -867,11 +1194,14 @@ fn bind_keys(cx: &mut App) {
 
 fn main() {
     // Resolve the initial native path once, before entering GPUI's render lifecycle.
-    let initial_path = std::env::var_os("HOME")
+    let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
-        .filter(|home| home.is_absolute())
-        .unwrap_or_else(|| PathBuf::from("/"));
+        .filter(|home| home.is_absolute());
+    let cache = home
+        .as_ref()
+        .map(|home| home.join("Library/Caches/MTP-Native/transfers"));
+    let initial_path = home.unwrap_or_else(|| PathBuf::from("/"));
 
     let remote_config = RemoteConfig::from_startup();
 
@@ -895,12 +1225,12 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(800.0), px(500.0))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("MTP — 只读目录浏览".into()),
+                    title: Some("MTP — 目录浏览 / 单文件传输".into()),
                     ..Default::default()
                 }),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| MtpShell::new(initial_path, remote_config, window, cx)),
+            |window, cx| cx.new(|cx| MtpShell::new(initial_path, remote_config, cache, window, cx)),
         );
         if let Err(error) = result {
             eprintln!("无法创建 GPUI 窗口: {error:#}");
@@ -914,6 +1244,172 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seed_single_file_session(shell: &mut MtpShell) {
+        let key = match mtp_domain::DeviceKey::new("private-ui-fixture") {
+            Ok(key) => key,
+            Err(_) => panic!("invalid test key"),
+        };
+        let session = mtp_application::SessionInfo {
+            device_key: key.clone(),
+            display_name: "Fixture display name".into(),
+            generation: mtp_domain::SessionGeneration(42),
+            capabilities: mtp_backend_api::Capabilities {
+                simulated: false,
+                browse: true,
+                upload: true,
+                download: true,
+                cancel_current: false,
+            },
+        };
+        let root = session.root(mtp_domain::StorageId(1));
+        let source = mtp_domain::RemoteRef::new(
+            key,
+            session.generation,
+            mtp_domain::StorageId(1),
+            mtp_domain::ObjectId(3),
+        );
+        let revision = match shell
+            .remote
+            .begin(&RemoteCommand::Connect(RemoteConfig::Unconfigured))
+        {
+            Some(revision) => revision,
+            None => panic!("unexpected test epoch rejection"),
+        };
+        assert!(shell.remote.complete(
+            revision,
+            Ok(remote::RemoteReply::Connected {
+                session,
+                storages: vec![mtp_backend_api::Storage {
+                    id: 1,
+                    name: "Storage".into(),
+                    capacity: None
+                }],
+                root: Some(RemoteLocation {
+                    directory: root.clone(),
+                    label: "Storage".into()
+                }),
+                entries: vec![mtp_application::RemoteEntry {
+                    reference: source.clone(),
+                    name: "remote.txt".into(),
+                    directory: false,
+                    byte_size: Some(3)
+                }],
+            })
+        ));
+        shell.remote.locations.push(RemoteLocation {
+            directory: root,
+            label: "Folder".into(),
+        });
+        shell.remote.selected = Some(source);
+        let path = shell.local.path.join("中文.txt");
+        shell.local.entries = vec![mtp_local_fs::LocalEntry {
+            name: "中文.txt".into(),
+            path: path.clone(),
+            kind: EntryKind::File,
+            byte_size: Some(3),
+            modified_at: None,
+            metadata_error: None,
+        }];
+        shell.local.selected = Some(path);
+        shell.transfer.cache = Some(PathBuf::from(
+            "/home/test/Library/Caches/MTP-Native/transfers",
+        ));
+    }
+
+    #[gpui::test]
+    fn single_file_busy_handlers_preserve_epoch_and_terminal_uses_captured_target(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            MtpShell::state(
+                PathBuf::from("/captured/local"),
+                RemoteConfig::Unconfigured,
+                window,
+                cx,
+            )
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |shell, cx| {
+                seed_single_file_session(shell);
+                assert!(shell.upload_plan().is_ok());
+                let plan = match shell.download_plan() {
+                    Ok(plan) => plan,
+                    Err(_) => panic!("expected download snapshot"),
+                };
+                let epoch = shell.remote.transfer_epoch();
+                let current = shell.remote.current().cloned();
+                let id = match shell.transfer.begin(plan) {
+                    Ok(id) => id,
+                    Err(_) => panic!("unexpected task rejection"),
+                };
+                shell.connect_remote(window, cx);
+                shell.disconnect_remote(window, cx);
+                shell.refresh_remote(&RefreshRemote, window, cx);
+                shell.parent_remote(&ParentRemote, window, cx);
+                shell.select_storage(0, window, cx);
+                shell.root_remote(window, cx);
+                shell.request_remote(RemoteCommand::Disconnect, cx);
+                shell.start_upload(cx);
+                shell.start_download(cx);
+                assert_eq!(shell.remote.transfer_epoch(), epoch);
+                assert!(shell.remote.current().cloned() == current);
+                assert!(shell.remote.session.is_some());
+                assert_eq!(shell.remote.locations.len(), 2);
+                assert!(shell.transfer.busy());
+                assert!(
+                    shell
+                        .local
+                        .begin(PathBuf::from("/user/navigated/elsewhere"))
+                        .is_ok()
+                );
+                assert!(
+                    shell
+                        .transfer
+                        .complete(id, transfers::TransferOutcome::Skipped)
+                );
+                assert_eq!(shell.local.path, PathBuf::from("/user/navigated/elsewhere"));
+                assert_eq!(
+                    shell.transfer.target_summary().as_deref(),
+                    Some("捕获下载目标: /captured/local · 源: remote.txt")
+                );
+                assert!(shell.transfer.summary().contains("Skipped"));
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn legacy_capabilities_and_directory_selection_disable_single_file_plans(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            MtpShell::state(
+                PathBuf::from("/captured/local"),
+                RemoteConfig::Unconfigured,
+                window,
+                cx,
+            )
+        });
+        view.update(cx, |shell, _| {
+            seed_single_file_session(shell);
+            let Some(session) = shell.remote.session.as_mut() else {
+                panic!("missing fixture session")
+            };
+            session.capabilities.upload = false;
+            session.capabilities.download = false;
+            assert!(shell.upload_plan().is_err());
+            assert!(shell.download_plan().is_err());
+            let Some(session) = shell.remote.session.as_mut() else {
+                panic!("missing fixture session")
+            };
+            session.capabilities.upload = true;
+            session.capabilities.download = true;
+            shell.local.entries[0].kind = EntryKind::Directory;
+            shell.remote.entries[0].directory = true;
+            assert!(shell.upload_plan().is_err());
+            assert!(shell.download_plan().is_err());
+        });
+    }
 
     #[gpui::test]
     fn tab_focus_and_remote_shortcuts_do_not_touch_local(cx: &mut gpui::TestAppContext) {

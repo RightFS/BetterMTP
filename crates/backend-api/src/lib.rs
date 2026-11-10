@@ -37,6 +37,68 @@ pub struct Command {
     pub operation: Operation,
 }
 
+/// Exact Unix pathname bytes. Labels must never be converted back into paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct LocalPath(Vec<u8>);
+
+impl LocalPath {
+    pub fn from_path(path: &std::path::Path) -> Result<Self, std::io::Error> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let bytes = path.as_os_str().as_bytes();
+            if !path.is_absolute() || bytes.contains(&0) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "local path must be absolute without NUL",
+                ));
+            }
+            Ok(Self(bytes.to_vec()))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "local byte paths require Unix",
+            ))
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn to_path_buf(&self) -> std::path::PathBuf {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(self.0.clone()).into()
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalPath {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        if bytes.first() != Some(&b'/') || bytes.contains(&0) {
+            return Err(serde::de::Error::custom(
+                "local path must be absolute without NUL",
+            ));
+        }
+        Ok(Self(bytes))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileConflictPolicy {
+    Skip,
+    KeepBoth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferDirection {
+    Upload,
+    Download,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
@@ -45,6 +107,19 @@ pub enum Operation {
     List {
         storage_id: u32,
         parent_id: Option<u32>,
+    },
+    UploadFile {
+        storage_id: u32,
+        parent_id: Option<u32>,
+        source: LocalPath,
+        cache_directory: LocalPath,
+        requested_name: String,
+    },
+    DownloadFile {
+        storage_id: u32,
+        object_id: u32,
+        destination: LocalPath,
+        policy: FileConflictPolicy,
     },
     Disconnect,
     InjectFailure {
@@ -94,6 +169,14 @@ pub enum Value {
     Entries {
         entries: Vec<Entry>,
     },
+    Transferred {
+        direction: TransferDirection,
+        actual_name: String,
+        bytes: u64,
+        object_id: Option<u32>,
+        local_path: Option<LocalPath>,
+        journal_path: LocalPath,
+    },
     Disconnected,
     ShuttingDown,
 }
@@ -124,6 +207,8 @@ pub struct BackendError {
     pub session_usable: bool,
     /// Never inferred from the fact that an IPC operation completed.
     pub requires_review: bool,
+    #[serde(default)]
+    pub journal_path: Option<LocalPath>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +224,8 @@ pub enum ErrorCode {
     PermissionDenied,
     NoSpace,
     UnknownOutcome,
+    Skipped,
+    SourceChanged,
 }
 
 #[derive(Debug, Error)]
@@ -239,6 +326,49 @@ mod tests {
             operation: Operation::Connect,
         }
     }
+    #[cfg(unix)]
+    #[test]
+    fn local_paths_round_trip_exact_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/a-\xff".to_vec()));
+        let local = LocalPath::from_path(&path).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<LocalPath>(&serde_json::to_vec(&local).unwrap())
+                .unwrap()
+                .to_path_buf(),
+            path
+        );
+    }
+    #[test]
+    fn relative_and_nul_local_paths_are_rejected_on_both_boundaries() {
+        assert!(LocalPath::from_path(std::path::Path::new("relative")).is_err());
+        assert!(serde_json::from_str::<LocalPath>("[114,101,108]").is_err());
+        assert!(serde_json::from_str::<LocalPath>("[47,0]").is_err());
+    }
+    #[test]
+    fn old_backend_error_frames_default_to_no_journal() {
+        let error: BackendError = serde_json::from_str(r#"{"code":"unsupported","message":"read only","session_usable":true,"requires_review":false}"#).unwrap();
+        assert_eq!(error.journal_path, None);
+    }
+    #[test]
+    fn single_file_operation_round_trips_without_file_contents() {
+        let operation = Operation::UploadFile {
+            storage_id: 7,
+            parent_id: None,
+            source: LocalPath::from_path(std::path::Path::new("/source")).unwrap(),
+            cache_directory: LocalPath::from_path(std::path::Path::new("/cache")).unwrap(),
+            requested_name: "report.txt".into(),
+        };
+        let mut message = command();
+        message.operation = operation;
+        let mut output = Vec::new();
+        write_frame(&mut output, &message).unwrap();
+        assert_eq!(
+            read_frame::<Command>(&mut output.as_slice()).unwrap(),
+            Some(message)
+        );
+    }
+
     #[test]
     fn round_trip() {
         let mut data = Vec::new();

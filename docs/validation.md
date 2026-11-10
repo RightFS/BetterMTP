@@ -86,3 +86,15 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo run --locked -p a
 实际新编译 Go 库（arm64 / macOS 26.6）通过 worker 启动只读探针，得到明确 `ErrorMtpDetectFailed: no MTP devices found`，探针退出 1；系统 USB 列表也未看到 Android。这个结果证明真实 Go/C 过渡库能够在隔离 worker 加载并回传失败，不是设备/USB 传输通过，更没有 fake fallback。
 
 后续加固 FD 上传/下载 ABI、原子最终落盘、journal、`.app` local developer packaging 的独立证据分别见 [原生安全层](kalam-native-safety.md)、[本地事务](local-transfer-safety.md)、[本地打包](local-package.md)。未实际接线的能力不开放为可用按钮；签名/最低 OS/Intel/真机及上游再分发授权仍是发布门禁。
+
+## FD 单文件服务与原生 UI：本轮验证
+
+默认核心 `cargo test --all-targets --locked` **200 项通过**；GPUI `cargo test -p app-gpui --locked` **24 项通过**。随后严格 `cargo clippy --workspace --all-targets --locked -- -D warnings`、app/worker/probe debug build、fake/local probe 退出 0。依赖自身的 `block` / `proc-macro-error2` future-incompatibility warning 仍在，没有将其误算为本工程代码 lint 失败。
+
+安全 binding 共 4 个顶层测试，通过两个 driver 运行 **45 个隔离子进程情景**。真实 worker + 受控 C FD fixture 共 **21 个** macOS 集成测试通过，覆盖 7B/0B、NOREPLACE/Skip/KeepBoth、旧 ABI 不开放写入、stale refs、错误 native done、错误 raw generation、source 在 USB 调用期间变化仍完成 immutable snapshot、stop handle 及时打断长调用、worker death/timeout 保存 dispatch journal 与 RequiresReview。
+
+本地事务 68 项 macOS 测试通过。journal 的 parent path 现在 byte-exact 序列化，兼容旧字符串读取；实际非法 UTF-8 文件/目录创建只能在 Linux 验证。macOS APFS 返回 `EILSEQ`，两 worker filesystem 及三 local transaction 情景明确限定 Linux，纯内存 codec/serde 测试保留在 macOS；没有替换文件系统规避这一差异，也没有声称 Linux 实测已通过。
+
+短 native timeout 测试现在用正常 20s handshake budget，握手成功后才设置 1s native 调用 budget；原先将短预算用于并行 fixture 预加载/握手会偶发在测试目标调用之前超时。这不是放宽实际 stalled call 断言：Initialize 仍故意停顿 2s、必须被杀并且 session 不可复用。
+
+这些是受控 SDK/IPC/文件系统回归，**不是实际 Android 传输通过**。当前仅普通单文件，不递归目录、不 Replace、不伪造 USB Cancel；执行中的真实字节进度尚未转成 UI 百分比，只展示处理中和已验证结果。目录树、重启后 journal 核对 UX、真实设备/大文件、视觉/IME/拖放及发行授权仍待后续迭代。

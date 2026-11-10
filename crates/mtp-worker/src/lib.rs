@@ -27,6 +27,7 @@ impl FakeSession {
             message: message.into(),
             session_usable: self.connected,
             requires_review,
+            journal_path: None,
         }
     }
     fn require_session(&self, generation: Option<u64>) -> Result<(), BackendError> {
@@ -160,6 +161,12 @@ impl FakeSession {
                         }
                         Err(self.error(code, message, review))
                     }
+                    Operation::UploadFile { .. } | Operation::DownloadFile { .. } => Err(self
+                        .error(
+                            ErrorCode::Unsupported,
+                            "simulated backend is read-only; no files were written",
+                            false,
+                        )),
                     Operation::Connect | Operation::Shutdown => unreachable!("handled above"),
                 }
             }
@@ -220,6 +227,40 @@ mod tests {
             operation,
         }
     }
+    #[test]
+    fn fake_transfer_operations_are_unsupported_without_accessing_local_paths() {
+        let mut session = FakeSession::default();
+        session.execute(&command(1, None, Operation::Connect));
+        let path = LocalPath::from_path(std::path::Path::new("/not-accessed")).unwrap();
+        for operation in [
+            Operation::UploadFile {
+                storage_id: 1,
+                parent_id: None,
+                source: path.clone(),
+                cache_directory: path.clone(),
+                requested_name: "report.txt".into(),
+            },
+            Operation::DownloadFile {
+                storage_id: 1,
+                object_id: 2,
+                destination: path.clone(),
+                policy: FileConflictPolicy::KeepBoth,
+            },
+        ] {
+            assert!(matches!(
+                session.execute(&command(2, Some(session.generation()), operation)),
+                Outcome::Failure {
+                    error: BackendError {
+                        code: ErrorCode::Unsupported,
+                        requires_review: false,
+                        ..
+                    }
+                }
+            ));
+        }
+        assert!(session.connected);
+    }
+
     #[test]
     fn no_session_is_explicit_error() {
         assert!(matches!(

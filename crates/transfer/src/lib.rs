@@ -8,6 +8,7 @@ compile_error!("mtp-transfer MVP supports macOS and Linux only; no unsafe fallba
 use std::ffi::OsStr;
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
@@ -39,6 +40,8 @@ pub enum TransferError {
     NotRegular,
     #[error("operation not valid for task state {0:?}")]
     InvalidState(TaskState),
+    #[error("invalid verified remote upload receipt: {0}")]
+    InvalidReceipt(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +84,62 @@ impl FileIdentity {
     }
 }
 
+/// Native metadata already verified/authorized by the worker's current call.
+/// This local receipt does not prove content hashes or device durability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteUploadReceipt {
+    pub storage_id: u32,
+    pub object_id: u32,
+    pub actual_name: String,
+    pub bytes: u64,
+    /// Optional canonical absolute remote path, not a local filesystem path.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl RemoteUploadReceipt {
+    fn validate(&self, expected_size: u64) -> Result<()> {
+        if self.bytes != expected_size {
+            return Err(TransferError::SizeMismatch {
+                expected: expected_size,
+                actual: self.bytes,
+            });
+        }
+        if self.storage_id == 0
+            || self.storage_id == u32::MAX
+            || self.object_id == 0
+            || self.object_id == u32::MAX
+        {
+            return Err(TransferError::InvalidReceipt(
+                "storage/object ID is zero or reserved MAX".to_owned(),
+            ));
+        }
+        validate_basename(&self.actual_name)?;
+        if let Some(path) = &self.path {
+            let suffix = path.strip_prefix('/').ok_or_else(|| {
+                TransferError::InvalidReceipt(
+                    "remote path must be canonical and absolute".to_owned(),
+                )
+            })?;
+            // Inspect raw slash-separated components: Path::components would
+            // normalize '.', duplicate slashes, etc. and hide malformed inputs.
+            for component in suffix.split('/') {
+                validate_basename(component).map_err(|_| {
+                    TransferError::InvalidReceipt(
+                        "remote path has an unsafe/noncanonical component".to_owned(),
+                    )
+                })?;
+            }
+            if suffix.rsplit('/').next() != Some(self.actual_name.as_str()) {
+                return Err(TransferError::InvalidReceipt(
+                    "remote path basename differs from actual_name".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Audit data only. Deserializing a journal does NOT grant cleanup authority.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Journal {
@@ -88,6 +147,7 @@ pub struct Journal {
     pub owner: String,
     pub kind: StageKind,
     pub state: TaskState,
+    #[serde(with = "unix_path_serde")]
     pub parent_path: PathBuf,
     pub stage_name: String,
     pub payload_name: String,
@@ -100,10 +160,65 @@ pub struct Journal {
     pub expected_size: u64,
     pub final_name: Option<String>,
     pub published_name: Option<String>,
-    /// True only after the publication syscall returned success in this process.
+    /// True after local publication succeeds, or an authorized worker records
+    /// a verified native upload receipt. Never proof of device durability.
     /// Crash recovery must still inspect identities; JSON alone is not authority.
     pub publication_confirmed: bool,
+    #[serde(default)]
+    pub remote_upload: Option<RemoteUploadReceipt>,
+    /// Durable intent/evidence written before native download dispatch. It does
+    /// not authorize replay and may be true even if the native call never ran.
+    #[serde(default)]
+    pub native_dispatched: bool,
     pub failure: Option<String>,
+}
+
+// Journal audit paths preserve exact Unix bytes. They never authorize cleanup.
+mod unix_path_serde {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum EncodedPath {
+        Legacy(String),
+        Bytes(Vec<u8>),
+    }
+
+    pub fn serialize<S: Serializer>(
+        path: &Path,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let bytes = path.as_os_str().as_bytes();
+        if !path.is_absolute() || bytes.contains(&0) {
+            return Err(serde::ser::Error::custom(
+                "journal parent path must be absolute and contain no NUL",
+            ));
+        }
+        bytes.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<PathBuf, D::Error> {
+        let bytes = match EncodedPath::deserialize(deserializer)? {
+            EncodedPath::Legacy(text) => text.into_bytes(),
+            EncodedPath::Bytes(bytes) => bytes,
+        };
+        if bytes.contains(&0) {
+            return Err(serde::de::Error::custom("journal parent path contains NUL"));
+        }
+        let path = PathBuf::from(OsString::from_vec(bytes));
+        if !path.is_absolute() {
+            return Err(serde::de::Error::custom(
+                "journal parent path must be absolute",
+            ));
+        }
+        Ok(path)
+    }
 }
 
 /// Reject separators on both platforms, NUL/control characters, dot entries,
@@ -118,6 +233,23 @@ pub fn validate_basename(name: &str) -> Result<()> {
             .any(|c| c == '/' || c == '\\' || c.is_control())
     {
         return Err(TransferError::UnsafeName(name.to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_source_basename(name: &OsStr) -> Result<()> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty()
+        || bytes == b"."
+        || bytes == b".."
+        || bytes.len() > 255
+        || bytes
+            .iter()
+            .any(|b| *b == b'/' || *b == b'\\' || b.is_ascii_control())
+    {
+        return Err(TransferError::UnsafeName(
+            "invalid local source basename bytes".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -283,6 +415,8 @@ impl OwnedStage {
             final_name,
             published_name: None,
             publication_confirmed: false,
+            remote_upload: None,
+            native_dispatched: false,
             failure: None,
         };
         let mut stage = Self {
@@ -526,6 +660,21 @@ impl DownloadStage {
         &self.stage.journal
     }
 
+    /// Persist dispatch intent before entering native/USB code. On success the
+    /// state stays Staging so commit remains valid; SIGKILL leaves this evidence.
+    /// Never call native code if this fails, and never replay a marked stage.
+    pub fn mark_dispatched(&mut self) -> Result<()> {
+        if self.stage.journal.state != TaskState::Staging || self.stage.journal.native_dispatched {
+            return Err(TransferError::InvalidState(self.stage.journal.state));
+        }
+        self.stage.journal.native_dispatched = true;
+        let result = self.stage.save();
+        if let Err(error) = &result {
+            self.stage.failure(error);
+        }
+        result
+    }
+
     /// The backend must have closed all payload writers before calling commit.
     /// Default Skip is an explicit error, never false success using old bytes.
     /// Publication can succeed before journal/fsync fails: NeedsReview plus
@@ -676,15 +825,13 @@ impl UploadStage {
             .file_name()
             .ok_or_else(|| TransferError::UnsafeName(source.display().to_string()))?
             .to_owned();
-        let source_text = source_name
-            .to_str()
-            .ok_or_else(|| TransferError::UnsafeName(source.display().to_string()))?;
-        validate_basename(source_text)?;
+        validate_source_basename(&source_name)?;
         let (source_parent, parent_path) =
             open_directory(source.parent().unwrap_or_else(|| Path::new(".")))?;
         let mut source_file = open_regular(&source_parent, &source_name)?;
         let snapshot = SourceSnapshot::of(&source_file.metadata()?)?;
-        let payload_name = random_basename(source_text);
+        // UTF-8 is only an optional extension hint, never used to rebuild I/O paths.
+        let payload_name = random_basename(source_name.to_str().unwrap_or("snapshot"));
         let mut stage = OwnedStage::create(
             app_cache,
             &payload_name,
@@ -759,9 +906,48 @@ impl UploadStage {
         &self.stage.journal
     }
 
-    /// Optional recheck after remote work; detects inode, size, mtime and ctime
-    /// changes, not a cryptographic snapshot/hash guarantee.
+    /// Record metadata from the worker's verified current native upload call.
+    /// The worker MUST persist dispatch-pending NeedsReview before USB work and
+    /// verify the receipt against that call; this type alone is not authorization.
+    /// No source recheck is required: the immutable captured snapshot was sent.
+    /// On save/ownership failure retain the receipt and possible-publication
+    /// evidence in live NeedsReview state; do not retry upload or delete objects.
+    pub fn mark_uploaded(&mut self, receipt: RemoteUploadReceipt) -> Result<()> {
+        if !matches!(
+            self.stage.journal.state,
+            TaskState::Ready | TaskState::NeedsReview
+        ) || self.stage.journal.publication_confirmed
+            || self.stage.journal.remote_upload.is_some()
+            || self.stage.cleaned
+        {
+            return Err(TransferError::InvalidState(self.stage.journal.state));
+        }
+        if let Err(error) = receipt.validate(self.file_size()) {
+            self.stage.failure(&error);
+            return Err(error);
+        }
+        self.stage.journal.publication_confirmed = true;
+        self.stage.journal.published_name = Some(receipt.actual_name.clone());
+        self.stage.journal.remote_upload = Some(receipt);
+        let result = (|| -> Result<()> {
+            self.stage.validate_payload()?;
+            self.stage.journal.state = TaskState::Committed;
+            self.stage.journal.failure = None;
+            self.stage.save()
+        })();
+        if let Err(error) = &result {
+            self.stage.failure(error);
+        }
+        result
+    }
+
+    /// Optional pre-dispatch source recheck; detects inode/size/mtime/ctime
+    /// changes, not hashes. After committed upload, an error is only a warning
+    /// and never downgrades the receipt: captured snapshot bytes were uploaded.
     pub fn check_source_unchanged(&mut self) -> Result<()> {
+        if self.stage.cleaned {
+            return Err(TransferError::InvalidState(TaskState::Cleaned));
+        }
         let result = (|| -> Result<()> {
             let current = open_regular(&self.source_parent, &self.source_name)
                 .map_err(source_recheck_error)?;
@@ -777,7 +963,9 @@ impl UploadStage {
             }
             Ok(())
         })();
-        if let Err(error) = &result {
+        if let Err(error) = &result
+            && self.stage.journal.state != TaskState::Committed
+        {
             self.stage.failure(error);
         }
         result
@@ -785,6 +973,14 @@ impl UploadStage {
 
     /// Verify snapshot ownership/size and sync again before transport reads it.
     pub fn validate_staged(&mut self) -> Result<()> {
+        if !matches!(
+            self.stage.journal.state,
+            TaskState::Ready | TaskState::NeedsReview
+        ) || self.stage.journal.publication_confirmed
+            || self.stage.cleaned
+        {
+            return Err(TransferError::InvalidState(self.stage.journal.state));
+        }
         let result = self.stage.validate_payload();
         if let Err(error) = &result {
             self.stage.failure(error);
@@ -793,8 +989,13 @@ impl UploadStage {
     }
 
     pub fn mark_needs_review(&mut self, reason: &str) -> Result<()> {
-        if self.stage.cleaned {
-            return Err(TransferError::InvalidState(TaskState::Cleaned));
+        if self.stage.cleaned
+            || matches!(
+                self.stage.journal.state,
+                TaskState::Committed | TaskState::Skipped
+            )
+        {
+            return Err(TransferError::InvalidState(self.stage.journal.state));
         }
         self.stage.journal.state = TaskState::NeedsReview;
         self.stage.journal.failure = Some(reason.to_owned());

@@ -13,6 +13,7 @@ mtp-local-fs.workspace = true
 mtp-application.workspace = true
 mtp-domain.workspace = true
 mtp-backend-api.workspace = true
+rustix = { version = "=1.1.6", features = ["fs"] }
 
 [dev-dependencies]
 gpui = { version = "=0.2.2", features = ["test-support"] }

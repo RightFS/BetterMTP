@@ -5,11 +5,13 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
-use mtp_application::{ApplicationError, BackendConfig, RemoteEntry, SessionInfo, WorkerClient};
+use mtp_application::{
+    ApplicationError, BackendConfig, RemoteEntry, SessionInfo, WorkerClient, WorkerStopHandle,
+};
 use mtp_backend_api::Storage;
 use mtp_domain::{RemoteDirectoryRef, RemoteRef, StorageId};
 
@@ -124,6 +126,8 @@ impl RemoteConfig {
 /// operations before worker mutation, since executor scheduling is not FIFO.
 pub(crate) struct SharedWorker {
     slot: Mutex<Option<WorkerClient>>,
+    stop: Mutex<Option<WorkerStopHandle>>,
+    closed: AtomicBool,
     desired: AtomicU64,
 }
 
@@ -131,13 +135,42 @@ impl SharedWorker {
     fn new() -> Self {
         Self {
             slot: Mutex::new(None),
+            stop: Mutex::new(None),
+            closed: AtomicBool::new(false),
             desired: AtomicU64::new(0),
         }
+    }
+
+    /// Quick process kill only: no business mutex, no wait, no USB Cancel claim.
+    pub(crate) fn request_stop(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.desired.store(0, Ordering::SeqCst);
+        let stop = self
+            .stop
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(stop) = stop.as_ref() {
+            let _ = stop.request_stop();
+        }
+    }
+
+    fn register_stop(&self, handle: WorkerStopHandle) -> bool {
+        let mut stop = self
+            .stop
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if self.closed.load(Ordering::SeqCst) {
+            let _ = handle.request_stop();
+            return false;
+        }
+        *stop = Some(handle);
+        true
     }
 }
 
 impl Drop for SharedWorker {
     fn drop(&mut self) {
+        self.request_stop();
         // WorkerClient::drop kills/waits. Never perform that blocking cleanup on
         // the UI thread when a window releases the final shared handle.
         let slot = self
@@ -217,6 +250,9 @@ impl RemoteBrowser {
     }
 
     pub(crate) fn begin(&mut self, command: &RemoteCommand) -> Option<u64> {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return None;
+        }
         let Some(revision) = self.revision.checked_add(1) else {
             self.exhausted = true;
             self.shared.desired.store(0, Ordering::SeqCst);
@@ -268,6 +304,10 @@ impl RemoteBrowser {
         true
     }
 
+    pub(crate) fn transfer_epoch(&self) -> u64 {
+        self.revision
+    }
+
     pub(crate) fn current(&self) -> Option<&RemoteDirectoryRef> {
         self.locations.last().map(|location| &location.directory)
     }
@@ -312,6 +352,9 @@ fn safe_error(error: ApplicationError) -> String {
             "设备已断开；请重新连接。".into()
         }
         ApplicationError::Domain(_) => "远端引用或名称无效；连接已清除，请重连。".into(),
+        ApplicationError::UnknownOutcome { .. } => {
+            "设备操作结果未知；需要核对 journal 和实际文件。".into()
+        }
     }
 }
 
@@ -351,6 +394,9 @@ pub(crate) fn run(
                 let mut client =
                     WorkerClient::spawn(&worker_path, &BackendConfig::Kalam { library_path })
                         .map_err(safe_error)?;
+                if !shared.register_stop(client.stop_handle()) {
+                    return Ok(None);
+                }
                 if shared.desired.load(Ordering::SeqCst) != revision {
                     return Ok(None);
                 }
@@ -414,9 +460,213 @@ pub(crate) fn run(
     }
 }
 
+fn transfer_error(error: ApplicationError) -> crate::transfers::TransferOutcome {
+    use crate::transfers::TransferOutcome;
+    use mtp_backend_api::ErrorCode;
+    match error {
+        ApplicationError::UnknownOutcome { journal_path } => TransferOutcome::Failed {
+            message: "设备未提供可确认的传输终态".into(),
+            requires_review: true,
+            journal_path: journal_path.map(|path| path.to_path_buf()),
+        },
+        ApplicationError::Backend {
+            code: ErrorCode::Skipped,
+            requires_review: false,
+            ..
+        } => TransferOutcome::Skipped,
+        ApplicationError::Backend {
+            code,
+            requires_review,
+            ..
+        } => TransferOutcome::Failed {
+            message: format!("设备操作失败 ({code:?})"),
+            requires_review: requires_review || code == ErrorCode::UnknownOutcome,
+            journal_path: None,
+        },
+        ApplicationError::TimedOut(_)
+        | ApplicationError::Disconnected
+        | ApplicationError::Protocol(_)
+        | ApplicationError::UnexpectedResponse
+        | ApplicationError::IncompatibleHello => TransferOutcome::Failed {
+            message: "设备连接中断、超时或返回无效；不能确认结果".into(),
+            requires_review: true,
+            journal_path: None,
+        },
+        ApplicationError::NotConnected => TransferOutcome::Failed {
+            message: "设备未连接，未发起传输".into(),
+            requires_review: false,
+            journal_path: None,
+        },
+        ApplicationError::Io(_) => TransferOutcome::Failed {
+            message: "本地预检查或 worker IO 失败".into(),
+            requires_review: false,
+            journal_path: None,
+        },
+        ApplicationError::Domain(_) => TransferOutcome::Failed {
+            message: "文件名或远端会话引用无效".into(),
+            requires_review: false,
+            journal_path: None,
+        },
+    }
+}
+
+/// Always returns an independent terminal report, not an optional browse result.
+/// The UI freezes remote navigation/epoch while this task owns the client.
+pub(crate) fn run_transfer(
+    shared: Arc<SharedWorker>,
+    epoch: u64,
+    plan: crate::transfers::TransferPlan,
+) -> crate::transfers::TransferReport {
+    use crate::transfers::{TransferOutcome, TransferPlan, TransferReport};
+    let mut slot = match shared.slot.lock() {
+        Ok(slot) => slot,
+        Err(_) => {
+            return TransferReport {
+                outcome: TransferOutcome::Failed {
+                    message: "worker 状态锁异常；需要核对结果并重启".into(),
+                    requires_review: true,
+                    journal_path: None,
+                },
+                session_usable: false,
+            };
+        }
+    };
+    if shared.closed.load(Ordering::SeqCst) || shared.desired.load(Ordering::SeqCst) != epoch {
+        return TransferReport {
+            outcome: TransferOutcome::Failed {
+                message: "捕获会话已经失效，未发起传输".into(),
+                requires_review: false,
+                journal_path: None,
+            },
+            session_usable: false,
+        };
+    }
+    let Some(client) = slot.as_mut() else {
+        return TransferReport {
+            outcome: transfer_error(ApplicationError::NotConnected),
+            session_usable: false,
+        };
+    };
+    let result = match plan {
+        TransferPlan::Upload {
+            source,
+            requested_name,
+            destination,
+            cache,
+            ..
+        } => {
+            if let Err(message) = crate::transfers::ensure_cache(&cache) {
+                return TransferReport {
+                    outcome: TransferOutcome::Failed {
+                        message: message.into(),
+                        requires_review: false,
+                        journal_path: None,
+                    },
+                    session_usable: client.session().is_some(),
+                };
+            }
+            client.upload_file(&source, &requested_name, &destination, &cache)
+        }
+        TransferPlan::Download {
+            source,
+            destination,
+            policy,
+            ..
+        } => client.download_file(&source, &destination, policy),
+    };
+    let outcome = match result {
+        Ok(receipt) => TransferOutcome::Completed(receipt),
+        Err(error) => transfer_error(error),
+    };
+    let review = matches!(
+        &outcome,
+        TransferOutcome::Failed {
+            requires_review: true,
+            ..
+        }
+    );
+    let mut session_usable = client.session().is_some();
+    if review || !session_usable {
+        drop(slot.take());
+        session_usable = false;
+    }
+    TransferReport {
+        outcome,
+        session_usable,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_stop_does_not_need_the_busy_worker_slot() {
+        let mut browser = RemoteBrowser::new(RemoteConfig::Unconfigured);
+        let _ = begin(
+            &mut browser,
+            &RemoteCommand::Connect(RemoteConfig::Unconfigured),
+        );
+        let shared = browser.shared.clone();
+        let _business_guard = match shared.slot.lock() {
+            Ok(guard) => guard,
+            Err(_) => panic!("poisoned test lock"),
+        };
+        shared.request_stop();
+        assert!(shared.closed.load(Ordering::SeqCst));
+        assert_eq!(shared.desired.load(Ordering::SeqCst), 0);
+        assert!(browser.begin(&RemoteCommand::Disconnect).is_none());
+    }
+
+    #[test]
+    fn transfer_skip_is_not_success_and_review_evidence_is_preserved() {
+        use crate::transfers::TransferOutcome;
+        let skipped = transfer_error(ApplicationError::Backend {
+            code: mtp_backend_api::ErrorCode::Skipped,
+            message: "private backend details".into(),
+            requires_review: false,
+        });
+        assert!(matches!(skipped, TransferOutcome::Skipped));
+        let journal = match mtp_backend_api::LocalPath::from_path(std::path::Path::new(
+            "/safe/cache/journal.json",
+        )) {
+            Ok(path) => path,
+            Err(_) => panic!("invalid test journal path"),
+        };
+        let unknown = transfer_error(ApplicationError::UnknownOutcome {
+            journal_path: Some(journal),
+        });
+        assert!(matches!(
+            unknown,
+            TransferOutcome::Failed {
+                requires_review: true,
+                journal_path: Some(_),
+                ..
+            }
+        ));
+        let timeout = transfer_error(ApplicationError::TimedOut(std::time::Duration::from_secs(
+            1,
+        )));
+        assert!(matches!(
+            timeout,
+            TransferOutcome::Failed {
+                requires_review: true,
+                ..
+            }
+        ));
+        let backend_review = transfer_error(ApplicationError::Backend {
+            code: mtp_backend_api::ErrorCode::Skipped,
+            message: "private backend details".into(),
+            requires_review: true,
+        });
+        assert!(matches!(
+            backend_review,
+            TransferOutcome::Failed {
+                requires_review: true,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn explicit_library_wins_and_relative_paths_are_rejected() {

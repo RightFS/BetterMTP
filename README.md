@@ -11,7 +11,9 @@ OpenMTP 重构的独立 Rust 工程。首版目标：移除 Electron / Chromium 
 - 本地只读目录浏览；保留原始路径、不跟随 symlink 元数据。
 - GPUI 0.2.2 双面板已通过构建并实际启动；后台本地浏览、虚拟列表、焦点/快捷键，以及显式 Kalam 连接、存储与目录浏览已接线。
 - 隔离的真实 Kalam 动态绑定和应用级会话 token；worker 重启不会复用旧条目引用。没有真实库配置时不自动回退 fake。
-- 当前界面只读，上传/下载仍在安全 FD ABI、原子落盘与真机验收阶段；窗口创建不等于 IME、拖放或设备传输验收。
+- 单文件上传/下载已接线：只在显式可信 Go 库的 FD ABI v2 能力可用时开放。上传保留原文件并采用随机 KeepBoth 最终名；下载使用私人 staging、大小/身份验证与原子 NOREPLACE 最终落盘。
+- Skip 不算成功；未知结果、worker 被终止、接收结果错误均进入 RequiresReview，人工核对后重新连接，不自动重试或删除。原 source 在已捕获快照上传期间变化不会撤销已验证快照成功。
+- 当前还不递归目录、不支持 Replace 或 USB Cancel。完整目录传输、真机、大文件、视觉/IME/拖放及正式发行授权仍待验收，不能称为已完成的完整 MVP。
 
 ```bash
 # 核心：格式化检查、单元/子进程测试、严格 clippy、fake probe
@@ -47,8 +49,8 @@ Cargo 不在 PATH 时先 `export PATH="$HOME/.cargo/bin:$PATH"`。初始开发�
 - `domain`：设备/条目身份、任务状态和冲突安全规则，不依赖 UI/USB。
 - `backend-api`：有界、版本化 worker 通信；stdout 只承载协议。
 - `local-fs`：本地浏览，阻塞 IO 由调用方放后台执行。
-- `mtp-worker`：单会话 owner；显式 fake 与真实 Kalam adapter，目前只开放只读操作。
-- `backend-kalam`：只在 worker 加载可信 native 库；C callback 复制/释放与 stdout 隔离。
+- `mtp-worker`：单会话 owner；Fake 严格只读，可信 Kalam v2 才开放安全 FD 单文件操作。缓存对象 ID、storage 与原 parent 身份，不按 UI 显示路径重选目标。
+- `backend-kalam`：只在 worker 加载可信 native 库；C callback 复制/释放与 stdout 隔离。旧 ABI 保留只读兼容，精确 v2+方向 symbol 才允许借用独占 FD。
 - `application`：有 deadline 的 worker 客户端，app token 到 wire generation 的安全翻译。
 - `probe`：真实子进程端到端探针，区分模拟合同测试与真实设备读取。
 - `app-gpui`：真实原生双面板；界面测试使用 GPUI test context，不冒充 OS 交互或设备验证。

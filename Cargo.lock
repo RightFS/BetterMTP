@@ -84,6 +84,7 @@ dependencies = [
  "mtp-backend-api",
  "mtp-domain",
  "mtp-local-fs",
+ "rustix 1.1.6",
 ]
 
 [[package]]
@@ -3287,6 +3288,7 @@ dependencies = [
 name = "mtp-backend-kalam"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "libloading",
  "serde",
  "serde_json",
@@ -3338,6 +3340,7 @@ dependencies = [
  "mtp-backend-api",
  "mtp-backend-kalam",
  "mtp-domain",
+ "mtp-transfer",
  "serde_json",
 ]
 

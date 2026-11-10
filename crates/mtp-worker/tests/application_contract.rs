@@ -131,14 +131,16 @@ fn native_stdout_is_isolated_from_the_binary_control_transport() {
 #[test]
 fn stalled_native_call_is_killed_and_cannot_reuse_its_session() {
     let fixture = Fixture::build(&["-DFIXTURE_STALL"]);
-    let mut client = WorkerClient::spawn_with_deadline(
+    let mut client = WorkerClient::spawn(
         worker(),
         &BackendConfig::Kalam {
             library_path: fixture.0.clone(),
         },
-        Duration::from_secs(1),
     )
     .unwrap();
+    // Library preload/handshake may contend with parallel fixture subprocesses.
+    // Only the deliberately stalled native Initialize gets the short deadline.
+    client.set_deadline(Duration::from_secs(1));
     assert!(matches!(
         client.connect(),
         Err(ApplicationError::TimedOut(_))

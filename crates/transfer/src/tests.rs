@@ -786,6 +786,472 @@ fn upload_recheck_symlink_replacement_is_source_changed_without_following() {
     assert_eq!(stdfs::read(user).unwrap(), b"USER");
 }
 
+fn uploaded_receipt(bytes: u64) -> RemoteUploadReceipt {
+    RemoteUploadReceipt {
+        storage_id: 1,
+        object_id: 42,
+        actual_name: "uploaded.bin".to_owned(),
+        bytes,
+        path: Some("/uploads/uploaded.bin".to_owned()),
+    }
+}
+
+#[test]
+fn upload_verified_receipt_records_committed_without_deleting_snapshot() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("source");
+    stdfs::write(&source, b"DATA").unwrap();
+    let mut stage = UploadStage::new(&source, &fixture.directory("cache")).unwrap();
+    let receipt = uploaded_receipt(4);
+    stage.mark_uploaded(receipt.clone()).unwrap();
+    let journal = read_journal(stage.journal_path());
+    assert_eq!(journal.state, TaskState::Committed);
+    assert!(journal.publication_confirmed);
+    assert_eq!(journal.published_name.as_deref(), Some("uploaded.bin"));
+    assert_eq!(journal.remote_upload, Some(receipt));
+    assert_eq!(stdfs::read(stage.staged_path()).unwrap(), b"DATA");
+    assert_eq!(stdfs::read(source).unwrap(), b"DATA");
+    assert!(stage.staging_directory().is_dir());
+}
+
+#[test]
+fn upload_zero_byte_receipt_allows_absent_path() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("source");
+    stdfs::write(&source, b"").unwrap();
+    let mut stage = UploadStage::new(&source, &fixture.directory("cache")).unwrap();
+    let mut receipt = uploaded_receipt(0);
+    receipt.path = None;
+    stage.mark_uploaded(receipt).unwrap();
+    assert_eq!(stage.journal().state, TaskState::Committed);
+    assert_eq!(stage.journal().remote_upload.as_ref().unwrap().bytes, 0);
+}
+
+#[test]
+fn upload_verified_receipt_accepts_dispatch_pending_needs_review() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("source");
+    stdfs::write(&source, b"DATA").unwrap();
+    let mut stage = UploadStage::new(&source, &fixture.directory("cache")).unwrap();
+    stage.mark_needs_review("USB dispatch pending").unwrap();
+    assert_eq!(
+        read_journal(stage.journal_path()).state,
+        TaskState::NeedsReview
+    );
+    stage.mark_uploaded(uploaded_receipt(4)).unwrap();
+    assert_eq!(stage.journal().state, TaskState::Committed);
+    assert_eq!(stage.journal().failure, None);
+}
+
+#[test]
+fn upload_receipt_requires_exact_u64_byte_count() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("source");
+    stdfs::write(&source, b"DATA").unwrap();
+    let cache = fixture.directory("cache");
+    for bytes in [0, 3, 5, u64::MAX] {
+        let mut stage = UploadStage::new(&source, &cache).unwrap();
+        assert!(matches!(stage.mark_uploaded(uploaded_receipt(bytes)),
+            Err(TransferError::SizeMismatch { expected: 4, actual }) if actual == bytes));
+        assert_eq!(stage.journal().state, TaskState::NeedsReview);
+        assert!(!stage.journal().publication_confirmed);
+        assert!(stage.journal().remote_upload.is_none());
+    }
+}
+
+#[test]
+fn upload_receipt_rejects_zero_and_reserved_storage_object_ids() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("source");
+    stdfs::write(&source, b"DATA").unwrap();
+    let cache = fixture.directory("cache");
+    for (storage_id, object_id) in [(0, 42), (u32::MAX, 42), (1, 0), (1, u32::MAX)] {
+        let mut stage = UploadStage::new(&source, &cache).unwrap();
+        let mut receipt = uploaded_receipt(4);
+        receipt.storage_id = storage_id;
+        receipt.object_id = object_id;
+        assert!(matches!(
+            stage.mark_uploaded(receipt),
+            Err(TransferError::InvalidReceipt(_))
+        ));
+        assert_eq!(stage.journal().state, TaskState::NeedsReview);
+        assert!(stage.journal().remote_upload.is_none());
+    }
+}
+
+#[test]
+fn upload_receipt_rejects_unsafe_actual_names() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("source");
+    stdfs::write(&source, b"DATA").unwrap();
+    let cache = fixture.directory("cache");
+    for name in ["", ".", "..", "../escape", "a/b", "a\\b", "x\0y", "x\ny"] {
+        let mut stage = UploadStage::new(&source, &cache).unwrap();
+        let mut receipt = uploaded_receipt(4);
+        receipt.actual_name = name.to_owned();
+        receipt.path = None;
+        assert!(matches!(
+            stage.mark_uploaded(receipt),
+            Err(TransferError::UnsafeName(_))
+        ));
+        assert_eq!(stage.journal().state, TaskState::NeedsReview);
+    }
+}
+
+#[test]
+fn upload_receipt_path_must_be_canonical_and_match_actual_name() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("source");
+    stdfs::write(&source, b"DATA").unwrap();
+    let cache = fixture.directory("cache");
+    for path in [
+        "relative/uploaded.bin",
+        "/",
+        "/uploads/../uploaded.bin",
+        "//uploads/uploaded.bin",
+        "/uploads//uploaded.bin",
+        "/uploads/./uploaded.bin",
+        "/uploads/uploaded.bin/",
+        "/uploads/different.bin",
+        "/uploads\\evil/uploaded.bin",
+        "/uploaded.bin\0",
+    ] {
+        let mut stage = UploadStage::new(&source, &cache).unwrap();
+        let mut receipt = uploaded_receipt(4);
+        receipt.path = Some(path.to_owned());
+        assert!(
+            matches!(
+                stage.mark_uploaded(receipt),
+                Err(TransferError::InvalidReceipt(_))
+            ),
+            "{path:?}"
+        );
+        assert!(stage.journal().remote_upload.is_none());
+    }
+}
+
+#[test]
+fn upload_committed_receipt_is_immutable_and_source_change_is_warning_only() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("source");
+    stdfs::write(&source, b"DATA").unwrap();
+    let mut stage = UploadStage::new(&source, &fixture.directory("cache")).unwrap();
+    stage.mark_uploaded(uploaded_receipt(4)).unwrap();
+    let before = stdfs::read(stage.journal_path()).unwrap();
+    assert!(matches!(
+        stage.mark_uploaded(uploaded_receipt(4)),
+        Err(TransferError::InvalidState(TaskState::Committed))
+    ));
+    assert!(matches!(
+        stage.mark_needs_review("late event"),
+        Err(TransferError::InvalidState(TaskState::Committed))
+    ));
+    assert!(matches!(
+        stage.validate_staged(),
+        Err(TransferError::InvalidState(TaskState::Committed))
+    ));
+    stdfs::write(&source, b"LATER CHANGE").unwrap();
+    assert!(matches!(
+        stage.check_source_unchanged(),
+        Err(TransferError::SourceChanged)
+    ));
+    assert_eq!(stage.journal().state, TaskState::Committed);
+    assert_eq!(stdfs::read(stage.journal_path()).unwrap(), before);
+    let journal_path = stage.journal_path().to_owned();
+    drop(stage);
+    assert_eq!(read_journal(&journal_path).state, TaskState::Committed);
+}
+
+#[test]
+fn upload_of_captured_snapshot_can_complete_after_original_source_change() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("source");
+    stdfs::write(&source, b"DATA").unwrap();
+    let mut stage = UploadStage::new(&source, &fixture.directory("cache")).unwrap();
+    stage.mark_needs_review("USB dispatch pending").unwrap();
+    stdfs::write(&source, b"changed before callback").unwrap();
+    stage.mark_uploaded(uploaded_receipt(4)).unwrap();
+    assert_eq!(stage.journal().state, TaskState::Committed);
+    assert_eq!(stdfs::read(stage.staged_path()).unwrap(), b"DATA");
+}
+
+#[test]
+fn upload_receipt_owned_journal_failure_retains_evidence_never_retries_or_deletes() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("source");
+    stdfs::write(&source, b"DATA").unwrap();
+    let mut stage = UploadStage::new(&source, &fixture.directory("cache")).unwrap();
+    stage.mark_needs_review("USB dispatch pending").unwrap();
+    stdfs::hard_link(stage.journal_path(), fixture.root.join("old-journal")).unwrap();
+    assert!(stage.journal_path().is_absolute());
+    assert!(stage.journal_path().starts_with(stage.staging_directory()));
+    assert_eq!(
+        named_identity(&stage.stage.directory, &stage.journal().journal_name).unwrap(),
+        stage.stage.journal_identity
+    );
+    stdfs::remove_file(stage.journal_path()).unwrap();
+    stdfs::write(stage.journal_path(), b"USER JOURNAL").unwrap();
+    let receipt = uploaded_receipt(4);
+    assert!(matches!(
+        stage.mark_uploaded(receipt.clone()),
+        Err(TransferError::Ownership)
+    ));
+    assert_eq!(stage.journal().state, TaskState::NeedsReview);
+    assert!(stage.journal().publication_confirmed);
+    assert_eq!(stage.journal().remote_upload, Some(receipt.clone()));
+    assert!(matches!(
+        stage.mark_uploaded(receipt),
+        Err(TransferError::InvalidState(TaskState::NeedsReview))
+    ));
+    assert!(stage.cleanup_owned().is_err());
+    assert_eq!(stdfs::read(stage.journal_path()).unwrap(), b"USER JOURNAL");
+    assert_eq!(stdfs::read(stage.staged_path()).unwrap(), b"DATA");
+    assert_eq!(stdfs::read(source).unwrap(), b"DATA");
+}
+
+#[test]
+fn upload_receipt_rejects_nonready_terminal_states() {
+    let fixture = Fixture::new();
+    let source = fixture.root.join("source");
+    stdfs::write(&source, b"DATA").unwrap();
+    let cache = fixture.directory("cache");
+    for state in [
+        TaskState::Staging,
+        TaskState::Publishing,
+        TaskState::Committed,
+        TaskState::Skipped,
+        TaskState::Cleaned,
+    ] {
+        let mut stage = UploadStage::new(&source, &cache).unwrap();
+        stage.stage.journal.state = state;
+        assert!(
+            matches!(stage.mark_uploaded(uploaded_receipt(4)), Err(TransferError::InvalidState(actual)) if actual == state)
+        );
+        assert_eq!(stage.journal().state, state);
+        assert!(stage.journal().remote_upload.is_none());
+    }
+}
+
+#[test]
+fn old_journal_json_defaults_receipt_and_dispatch_evidence() {
+    let fixture = Fixture::new();
+    let stage = fixture.download("payload", b"DATA");
+    let mut value = serde_json::to_value(stage.journal()).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.remove("remote_upload");
+    object.remove("native_dispatched");
+    let older: Journal = serde_json::from_value(value).unwrap();
+    assert!(older.remote_upload.is_none());
+    assert!(!older.native_dispatched);
+}
+
+#[test]
+fn download_dispatch_intent_is_durable_staging_and_commit_still_works() {
+    let fixture = Fixture::new();
+    let mut stage = DownloadStage::new(&fixture.root, "payload", 4).unwrap();
+    stage.mark_dispatched().unwrap();
+    let journal = read_journal(stage.journal_path());
+    assert_eq!(journal.state, TaskState::Staging);
+    assert!(journal.native_dispatched);
+    assert!(!journal.publication_confirmed);
+    let before = stdfs::read(stage.journal_path()).unwrap();
+    assert!(matches!(
+        stage.mark_dispatched(),
+        Err(TransferError::InvalidState(TaskState::Staging))
+    ));
+    assert_eq!(stdfs::read(stage.journal_path()).unwrap(), before);
+    let mut payload = stage.payload_file();
+    payload.write_all(b"DATA").unwrap();
+    stage.commit().unwrap();
+    assert_eq!(stage.journal().state, TaskState::Committed);
+    assert!(stage.journal().native_dispatched);
+    assert!(matches!(
+        stage.mark_dispatched(),
+        Err(TransferError::InvalidState(TaskState::Committed))
+    ));
+}
+
+#[test]
+fn download_needs_review_must_not_restore_or_redispatch() {
+    let fixture = Fixture::new();
+    let mut stage = fixture.download("payload", b"DATA");
+    stage.mark_needs_review("dispatch interrupted").unwrap();
+    assert!(matches!(
+        stage.mark_dispatched(),
+        Err(TransferError::InvalidState(TaskState::NeedsReview))
+    ));
+    assert!(!stage.journal().native_dispatched);
+    assert_eq!(stage.journal().state, TaskState::NeedsReview);
+}
+
+#[test]
+fn download_dispatch_journal_failure_must_not_authorize_usb() {
+    let fixture = Fixture::new();
+    let mut stage = fixture.download("payload", b"DATA");
+    stdfs::hard_link(stage.journal_path(), fixture.root.join("old-journal")).unwrap();
+    assert!(stage.journal_path().is_absolute());
+    assert!(stage.journal_path().starts_with(stage.staging_directory()));
+    assert_eq!(
+        named_identity(&stage.stage.directory, &stage.journal().journal_name).unwrap(),
+        stage.stage.journal_identity
+    );
+    stdfs::remove_file(stage.journal_path()).unwrap();
+    stdfs::write(stage.journal_path(), b"USER JOURNAL").unwrap();
+    assert!(matches!(
+        stage.mark_dispatched(),
+        Err(TransferError::Ownership)
+    ));
+    assert_eq!(stage.journal().state, TaskState::NeedsReview);
+    assert!(stage.journal().native_dispatched);
+    assert!(matches!(
+        stage.mark_dispatched(),
+        Err(TransferError::InvalidState(TaskState::NeedsReview))
+    ));
+    assert_eq!(stdfs::read(stage.journal_path()).unwrap(), b"USER JOURNAL");
+    assert!(!fixture.root.join("payload").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn upload_non_utf8_source_filename_uses_original_bytes_and_snapshot_fd() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new();
+    let filename = std::ffi::OsString::from_vec(vec![b's', 0xff, b'.', b'b', b'i', b'n']);
+    let source = fixture.root.join(&filename);
+    stdfs::write(&source, b"RAW NAME CONTENT").unwrap();
+    let mut stage = UploadStage::new(&source, &fixture.directory("cache")).unwrap();
+    assert_eq!(stage.source_name, filename);
+    assert_eq!(stage.source_path, source);
+    assert_eq!(stage.file_size(), 16);
+    assert!(
+        stage
+            .safe_name()
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    );
+    let mut snapshot = stage.staged_file();
+    let mut bytes = Vec::new();
+    snapshot.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"RAW NAME CONTENT");
+    stage.check_source_unchanged().unwrap();
+    stage.cleanup_owned().unwrap();
+    assert_eq!(stdfs::read(source).unwrap(), b"RAW NAME CONTENT");
+}
+
+#[test]
+fn journal_non_utf8_parent_path_roundtrips_bytes_in_memory() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new();
+    let stage = fixture.download("payload", b"DATA");
+    let mut journal = stage.journal().clone();
+    let bytes = vec![b'/', b'a', b'u', b'd', b'i', b't', b'/', 0xff];
+    // Artificial in-memory audit path only: never create invalid APFS names.
+    journal.parent_path = PathBuf::from(std::ffi::OsString::from_vec(bytes.clone()));
+    let value = serde_json::to_value(&journal).unwrap();
+    assert_eq!(value["parent_path"], serde_json::to_value(&bytes).unwrap());
+    let restored: Journal = serde_json::from_value(value).unwrap();
+    assert_eq!(restored.parent_path.as_os_str().as_bytes(), bytes);
+    assert_eq!(restored.version, 1);
+}
+
+#[test]
+fn journal_parent_path_accepts_legacy_absolute_string_json() {
+    let fixture = Fixture::new();
+    let stage = fixture.download("payload", b"DATA");
+    let mut value = serde_json::to_value(stage.journal()).unwrap();
+    value["parent_path"] = serde_json::Value::String(fixture.root.to_str().unwrap().to_owned());
+    let restored: Journal = serde_json::from_value(value).unwrap();
+    assert_eq!(restored.parent_path, fixture.root);
+}
+
+#[test]
+fn journal_parent_path_deserialize_rejects_nul_and_relative_encodings() {
+    let fixture = Fixture::new();
+    let stage = fixture.download("payload", b"DATA");
+    for encoded in [
+        serde_json::json!("relative"),
+        serde_json::json!("/a\0b"),
+        serde_json::json!([b'r', b'e', b'l']),
+        serde_json::json!([b'/', b'a', 0, b'b']),
+        serde_json::json!([]),
+    ] {
+        let mut value = serde_json::to_value(stage.journal()).unwrap();
+        value["parent_path"] = encoded;
+        assert!(serde_json::from_value::<Journal>(value).is_err());
+    }
+}
+
+#[test]
+fn journal_parent_path_serialize_rejects_nul_and_relative_paths() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new();
+    let stage = fixture.download("payload", b"DATA");
+    for path in [
+        PathBuf::from("relative"),
+        PathBuf::from(std::ffi::OsString::from_vec(b"/a\0b".to_vec())),
+    ] {
+        let mut journal = stage.journal().clone();
+        journal.parent_path = path;
+        assert!(serde_json::to_vec(&journal).is_err());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn download_non_utf8_destination_directory_commits_and_journals_exact_bytes() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new();
+    let destination = fixture
+        .root
+        .join(std::ffi::OsString::from_vec(vec![b'd', 0xff]));
+    stdfs::create_dir(&destination).unwrap();
+    let mut stage = DownloadStage::new(&destination, "payload", 4).unwrap();
+    stage.mark_dispatched().unwrap();
+    let mut payload = stage.payload_file();
+    payload.write_all(b"DATA").unwrap();
+    let final_path = stage.commit().unwrap();
+    assert_eq!(final_path, destination.join("payload"));
+    assert_eq!(stdfs::read(&final_path).unwrap(), b"DATA");
+    let restored = read_journal(stage.journal_path());
+    assert_eq!(
+        restored.parent_path.as_os_str().as_bytes(),
+        destination.as_os_str().as_bytes()
+    );
+    assert_eq!(restored.state, TaskState::Committed);
+    stage.cleanup_owned().unwrap();
+    assert_eq!(stdfs::read(final_path).unwrap(), b"DATA");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn upload_non_utf8_cache_directory_journals_receipt_without_lossy_paths() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new();
+    let cache = fixture
+        .root
+        .join(std::ffi::OsString::from_vec(vec![b'c', 0xfe]));
+    stdfs::create_dir(&cache).unwrap();
+    let source = fixture.root.join("source");
+    stdfs::write(&source, b"DATA").unwrap();
+    let mut stage = UploadStage::new(&source, &cache).unwrap();
+    stage.mark_needs_review("USB dispatch pending").unwrap();
+    stage.mark_uploaded(uploaded_receipt(4)).unwrap();
+    let restored = read_journal(stage.journal_path());
+    assert_eq!(
+        restored.parent_path.as_os_str().as_bytes(),
+        cache.as_os_str().as_bytes()
+    );
+    assert_eq!(restored.state, TaskState::Committed);
+    assert!(restored.remote_upload.is_some());
+    stage.cleanup_owned().unwrap();
+    assert_eq!(stdfs::read(source).unwrap(), b"DATA");
+}
+
 #[test]
 fn stage_permissions_are_private() {
     let fixture = Fixture::new();

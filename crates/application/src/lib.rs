@@ -6,6 +6,7 @@ use mtp_domain::{
     DeviceKey, DomainError, ObjectId, RemoteDirectoryRef, RemoteRef, SessionGeneration, StorageId,
 };
 use std::{
+    collections::HashMap,
     io,
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command as ProcessCommand, Stdio},
@@ -53,6 +54,18 @@ pub struct RemoteEntry {
     pub byte_size: Option<u64>,
 }
 
+pub use mtp_backend_api::{FileConflictPolicy, LocalPath, TransferDirection};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferReceipt {
+    pub direction: TransferDirection,
+    pub actual_name: String,
+    pub bytes: u64,
+    pub object_id: Option<u32>,
+    pub local_path: Option<LocalPath>,
+    pub journal_path: LocalPath,
+}
+
 #[derive(Debug, Error)]
 pub enum ApplicationError {
     #[error("worker IO: {0}")]
@@ -75,17 +88,40 @@ pub enum ApplicationError {
         message: String,
         requires_review: bool,
     },
+    #[error("transfer outcome is unknown; RequiresReview, do not retry or delete files")]
+    UnknownOutcome { journal_path: Option<LocalPath> },
     #[error(transparent)]
     Domain(#[from] DomainError),
 }
 
+/// Process-stop handle, not USB cancellation. Killing a dispatched transfer
+/// yields RequiresReview; the owning client observes EOF and reaps the child.
+#[derive(Clone)]
+pub struct WorkerStopHandle {
+    child: std::sync::Arc<std::sync::Mutex<Child>>,
+}
+impl WorkerStopHandle {
+    pub fn request_stop(&self) -> io::Result<()> {
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| io::Error::other("worker child lock poisoned"))?;
+        if child.try_wait()?.is_none() {
+            child.kill()?;
+        }
+        Ok(())
+    }
+}
+
 pub struct WorkerClient {
-    child: Child,
+    child: std::sync::Arc<std::sync::Mutex<Child>>,
     input: Option<ChildStdin>,
     messages: Receiver<Result<Option<ServerMessage>, ProtocolError>>,
     hello: Hello,
     next_request: u64,
     deadline: Duration,
+    transfer_deadline_override: Option<Duration>,
+    entry_sizes: HashMap<(u32, u32), u64>,
     wire_generation: Option<u64>,
     session: Option<SessionInfo>,
     closed: bool,
@@ -128,7 +164,7 @@ impl WorkerClient {
             }
         });
         let mut client = Self {
-            child,
+            child: std::sync::Arc::new(std::sync::Mutex::new(child)),
             input: Some(input),
             messages,
             hello: Hello {
@@ -146,6 +182,8 @@ impl WorkerClient {
             },
             next_request: 1,
             deadline,
+            transfer_deadline_override: None,
+            entry_sizes: HashMap::new(),
             wire_generation: None,
             session: None,
             closed: false,
@@ -161,6 +199,11 @@ impl WorkerClient {
             _ => return Err(ApplicationError::IncompatibleHello),
         }
         Ok(client)
+    }
+    pub fn stop_handle(&self) -> WorkerStopHandle {
+        WorkerStopHandle {
+            child: self.child.clone(),
+        }
     }
     pub fn hello(&self) -> &Hello {
         &self.hello
@@ -198,7 +241,13 @@ impl WorkerClient {
             .next_request
             .checked_add(1)
             .ok_or_else(|| io::Error::other("request IDs exhausted"))?;
-        let stable_session = matches!(&operation, Operation::Storages | Operation::List { .. });
+        let stable_session = matches!(
+            &operation,
+            Operation::Storages
+                | Operation::List { .. }
+                | Operation::UploadFile { .. }
+                | Operation::DownloadFile { .. }
+        );
         let input = self.input.as_mut().ok_or(ApplicationError::Disconnected)?;
         if let Err(error) = write_frame(
             input,
@@ -242,6 +291,11 @@ impl WorkerClient {
                             || error.code == ErrorCode::StaleSession
                         {
                             self.invalidate();
+                        }
+                        if error.requires_review {
+                            return Err(ApplicationError::UnknownOutcome {
+                                journal_path: error.journal_path,
+                            });
                         }
                         Err(ApplicationError::Backend {
                             code: error.code,
@@ -333,6 +387,10 @@ impl WorkerClient {
                 self.invalidate();
                 return Err(error.into());
             }
+            if let Some(size) = entry.byte_size {
+                self.entry_sizes
+                    .insert((directory.storage().0, entry.object_id), size);
+            }
             output.push(RemoteEntry {
                 reference: RemoteRef::new(
                     info.device_key.clone(),
@@ -347,6 +405,145 @@ impl WorkerClient {
         }
         Ok(output)
     }
+    /// Override read and transfer deadlines for controlled tests or explicit callers.
+    pub fn set_deadline(&mut self, deadline: Duration) {
+        self.deadline = deadline;
+        self.transfer_deadline_override = Some(deadline);
+    }
+
+    fn transfer_call(
+        &mut self,
+        operation: Operation,
+        bytes: Option<u64>,
+        direction: TransferDirection,
+    ) -> Result<TransferReceipt, ApplicationError> {
+        let read_deadline = self.deadline;
+        self.deadline = self.transfer_deadline_override.unwrap_or_else(|| {
+            Duration::from_secs(bytes.map_or(7200, |length| {
+                (length / (1024 * 1024)).saturating_add(120).min(7200)
+            }))
+        });
+        let result = self.call(self.wire_generation, operation);
+        self.deadline = read_deadline;
+        let value = match result {
+            Ok((_, value)) => value,
+            Err(error @ ApplicationError::Backend { .. }) => return Err(error),
+            Err(error @ ApplicationError::UnknownOutcome { .. }) => return Err(error),
+            Err(_) => {
+                self.invalidate();
+                return Err(ApplicationError::UnknownOutcome { journal_path: None });
+            }
+        };
+        let Value::Transferred {
+            direction: received,
+            actual_name,
+            bytes,
+            object_id,
+            local_path,
+            journal_path,
+        } = value
+        else {
+            self.invalidate();
+            return Err(ApplicationError::UnknownOutcome { journal_path: None });
+        };
+        if received != direction
+            || mtp_domain::RemoteFilename::new(&actual_name).is_err()
+            || actual_name.chars().any(char::is_control)
+            || object_id.is_none_or(|id| id == 0 || id == u32::MAX)
+            || (direction == TransferDirection::Download) != local_path.is_some()
+        {
+            self.invalidate();
+            return Err(ApplicationError::UnknownOutcome {
+                journal_path: Some(journal_path),
+            });
+        }
+        Ok(TransferReceipt {
+            direction,
+            actual_name,
+            bytes,
+            object_id,
+            local_path,
+            journal_path,
+        })
+    }
+
+    /// Remote identity comes from the session reference, never a display label.
+    pub fn upload_file(
+        &mut self,
+        source: &Path,
+        requested_name: &str,
+        dest: &RemoteDirectoryRef,
+        cache: &Path,
+    ) -> Result<TransferReceipt, ApplicationError> {
+        let info = self
+            .session
+            .as_ref()
+            .ok_or(ApplicationError::NotConnected)?;
+        dest.validate_session(&info.device_key, info.generation)?;
+        mtp_domain::RemoteFilename::new(requested_name)?;
+        if requested_name.chars().any(char::is_control) || requested_name.len() > 255 {
+            return Err(DomainError::InvalidRemoteFilename.into());
+        }
+        let source_path = LocalPath::from_path(source)?;
+        let cache_directory = LocalPath::from_path(cache)?;
+        if !info.capabilities.upload {
+            return Err(ApplicationError::Backend {
+                code: ErrorCode::Unsupported,
+                message: "backend has no verified upload capability".into(),
+                requires_review: false,
+            });
+        }
+        // Estimate only; worker independently validates NOFOLLOW snapshot metadata.
+        let size = std::fs::symlink_metadata(source)?.len();
+        self.transfer_call(
+            Operation::UploadFile {
+                storage_id: dest.storage().0,
+                parent_id: dest.parent().map(|id| id.0),
+                source: source_path,
+                cache_directory,
+                requested_name: requested_name.into(),
+            },
+            Some(size),
+            TransferDirection::Upload,
+        )
+    }
+
+    /// Destination is an existing directory, not a reconstructed target path.
+    pub fn download_file(
+        &mut self,
+        source: &RemoteRef,
+        dest: &Path,
+        policy: FileConflictPolicy,
+    ) -> Result<TransferReceipt, ApplicationError> {
+        let info = self
+            .session
+            .as_ref()
+            .ok_or(ApplicationError::NotConnected)?;
+        source.validate_session(&info.device_key, info.generation)?;
+        let destination = LocalPath::from_path(dest)?;
+        if !info.capabilities.download {
+            return Err(ApplicationError::Backend {
+                code: ErrorCode::Unsupported,
+                message: "backend has no verified download capability".into(),
+                requires_review: false,
+            });
+        }
+        let size = self
+            .entry_sizes
+            .get(&(source.storage().0, source.object().0))
+            .copied();
+        self.transfer_call(
+            Operation::DownloadFile {
+                storage_id: source.storage().0,
+                object_id: source.object().0,
+                destination,
+                policy,
+            },
+            size,
+            TransferDirection::Download,
+        )
+    }
+
     pub fn disconnect(&mut self) -> Result<(), ApplicationError> {
         if let Some(generation) = self.wire_generation {
             let result = self.call(Some(generation), Operation::Disconnect);
@@ -372,7 +569,12 @@ impl WorkerClient {
         self.input.take();
         let deadline = Instant::now() + self.deadline;
         loop {
-            if let Some(status) = self.child.try_wait()? {
+            let status = self
+                .child
+                .lock()
+                .map_err(|_| io::Error::other("worker child lock poisoned"))?
+                .try_wait()?;
+            if let Some(status) = status {
                 self.closed = true;
                 return if status.success() {
                     Ok(())
@@ -390,10 +592,13 @@ impl WorkerClient {
     fn invalidate(&mut self) {
         self.closed = true;
         self.session = None;
+        self.entry_sizes.clear();
         self.wire_generation = None;
         self.input.take();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 impl Drop for WorkerClient {

@@ -116,3 +116,7 @@ void FileExists(char *input, on_cb_result_t *ptr) {
 void Dispose(on_cb_result_t *ptr) {
     result(ptr, "{\"errorType\":\"\",\"error\":\"\",\"data\":true}");
 }
+
+#ifdef SAFETY_FD_V2
+#include "safe_fd.inc"
+#endif

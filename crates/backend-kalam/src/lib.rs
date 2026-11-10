@@ -1,4 +1,4 @@
-//! Narrow, synchronous, read-only Kalam C ABI adapter for an isolated worker.
+//! Narrow Kalam C ABI adapter: read-only compatibility and trusted v2 FD transfers.
 //! Loading native code is a trust boundary: only use an explicitly selected,
 //! vetted 64-bit library. Native crashes/hangs are not catchable Rust errors.
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -12,6 +12,9 @@ use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
+
+mod transfer;
+pub use transfer::{SafeDownloadRequest, SafeUploadPolicy, SafeUploadRequest};
 
 pub const MAX_CALLBACK_BYTES: usize = 1024 * 1024;
 pub type Result<T> = std::result::Result<T, KalamError>;
@@ -57,8 +60,16 @@ pub enum KalamError {
     Json(#[from] serde_json::Error),
     #[error("invalid Kalam result envelope: {0}")]
     Envelope(String),
-    #[error("Kalam native error ({error_type}): {message}")]
-    Native { error_type: String, message: String },
+    #[error(
+        "Kalam FD transfer {operation} is unavailable; verified SafetyVersion 2 and its safe symbol are required"
+    )]
+    TransferUnavailable { operation: &'static str },
+    #[error("Kalam native error (details withheld)")]
+    Native {
+        error_type: String,
+        message: String,
+        data: Option<Value>,
+    },
 }
 
 /// Duplicate the protocol stdout handle, then route native stdout to stderr.
@@ -159,7 +170,7 @@ pub struct KDevice {
     pub usb_device_info: Value,
 }
 
-/// Planning data only. No transfer symbols are loaded or callable this slice.
+/// Legacy planning data only; not accepted by the gated FD transfer methods.
 /// Construction does NOT establish destination safety or authorize a write.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SingleFileTransferPlan {
@@ -180,6 +191,10 @@ pub enum TransferDirection {
 type CallbackAddress = *mut c_void;
 type NoInput = unsafe extern "C" fn(CallbackAddress);
 type WithInput = unsafe extern "C" fn(*mut c_char, CallbackAddress);
+type SafetyVersion = unsafe extern "C" fn() -> u32;
+type SafeUpload =
+    unsafe extern "C" fn(*mut c_char, c_int, CallbackAddress, CallbackAddress, CallbackAddress);
+type SafeDownload = unsafe extern "C" fn(*mut c_char, c_int, CallbackAddress, CallbackAddress);
 
 struct Symbols {
     initialize: NoInput,
@@ -188,6 +203,9 @@ struct Symbols {
     walk: WithInput,
     exists: WithInput,
     dispose: NoInput,
+    safety_version: Option<u32>,
+    safe_upload: Option<SafeUpload>,
+    safe_download: Option<SafeDownload>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -227,6 +245,16 @@ static CALLBACK: Mutex<CallbackState> = Mutex::new(CallbackState {
     unexpected: false,
 });
 
+static EVENT_CALLBACK: Mutex<EventCallbackState> = Mutex::new(EventCallbackState {
+    active: false,
+    error: None,
+});
+
+struct EventCallbackState {
+    active: bool,
+    error: Option<KalamError>,
+}
+
 struct CallbackState {
     active: bool,
     count: usize,
@@ -265,6 +293,13 @@ impl Kalam {
         let library = ManuallyDrop::new(library);
         // SAFETY: these signatures exactly match the inspected header + C shim.
         // Function pointers stay valid because the library is never unloaded.
+        // SAFETY: caller must select a known trusted source/artifact; an export
+        // named SafetyVersion is not itself authentication of arbitrary code.
+        // Only exactly 2 permits resolving the FD signatures: v1 same-name
+        // transfer exports have a different ABI and must never be invoked.
+        let safety_version = unsafe { library.get::<SafetyVersion>(b"SafetyVersion\0") }
+            .ok()
+            .map(|marker| unsafe { marker() });
         let symbols = unsafe {
             Symbols {
                 initialize: symbol(&library, b"Initialize\0", "Initialize")?,
@@ -273,6 +308,23 @@ impl Kalam {
                 walk: symbol(&library, b"Walk\0", "Walk")?,
                 exists: symbol(&library, b"FileExists\0", "FileExists")?,
                 dispose: symbol(&library, b"Dispose\0", "Dispose")?,
+                safety_version,
+                safe_upload: if safety_version == Some(2) {
+                    library
+                        .get::<SafeUpload>(b"SafeUploadSingle\0")
+                        .ok()
+                        .map(|symbol| *symbol)
+                } else {
+                    None
+                },
+                safe_download: if safety_version == Some(2) {
+                    library
+                        .get::<SafeDownload>(b"SafeDownloadSingle\0")
+                        .ok()
+                        .map(|symbol| *symbol)
+                } else {
+                    None
+                },
             }
         };
         Ok(Self {
@@ -421,6 +473,9 @@ fn begin_callback() -> Result<()> {
 fn end_callback() -> Result<Value> {
     let mut slot = lock(&CALLBACK);
     slot.active = false;
+    if slot.unexpected {
+        return Err(KalamError::UnexpectedCallback);
+    }
     if slot.count > 1 {
         return Err(KalamError::DuplicateCallback);
     }
@@ -428,6 +483,78 @@ fn end_callback() -> Result<Value> {
         .take()
         .unwrap_or(Err(KalamError::MissingCallback))
         .and_then(validate_envelope)
+}
+
+fn begin_transfer_callback() -> Result<()> {
+    begin_callback()?;
+    let mut events = lock(&EVENT_CALLBACK);
+    events.active = true;
+    events.error = None;
+    Ok(())
+}
+
+fn end_transfer_callback() -> Result<Value> {
+    let event_error = {
+        let mut events = lock(&EVENT_CALLBACK);
+        events.active = false;
+        events.error.take()
+    };
+    // A terminal native error (especially ErrorNeedsReview) retains its typed
+    // uncertainty metadata even if an event also failed. Events cannot succeed
+    // a transfer or replace/count as the unique terminal result.
+    end_callback().and_then(|value| match event_error {
+        Some(error) => Err(error),
+        None => Ok(value),
+    })
+}
+
+extern "C" fn preprocess_callback(payload: *mut c_char) {
+    event_callback(payload);
+}
+extern "C" fn progress_callback(payload: *mut c_char) {
+    event_callback(payload);
+}
+
+fn event_callback(payload: *mut c_char) {
+    let _owned = OwnedPayload(payload);
+    let captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = if payload.is_null() {
+            Err(KalamError::NullCallback)
+        } else {
+            // SAFETY: same trusted C.CString transfer contract and cap as
+            // terminal payloads; result is Rust-owned, then discarded.
+            unsafe { copy_json(payload) }.and_then(validate_envelope)
+        };
+        let terminal = lock(&CALLBACK);
+        let mut events = lock(&EVENT_CALLBACK);
+        if !terminal.active || !events.active {
+            drop(events);
+            drop(terminal);
+            lock(&CALLBACK).unexpected = true;
+            return;
+        }
+        if terminal.count != 0 && events.error.is_none() {
+            events.error = Some(KalamError::Envelope(
+                "event callback arrived after terminal result".into(),
+            ));
+        }
+        if let Err(error) = result
+            && events.error.is_none()
+        {
+            events.error = Some(error);
+        }
+    }));
+    if captured.is_err() {
+        let terminal = lock(&CALLBACK);
+        let mut events = lock(&EVENT_CALLBACK);
+        if terminal.active && events.active {
+            events.error = Some(KalamError::CallbackPanic);
+        } else {
+            drop(events);
+            drop(terminal);
+            lock(&CALLBACK).unexpected = true;
+        }
+    }
 }
 
 struct OwnedPayload(*mut c_char);
@@ -506,6 +633,7 @@ fn validate_envelope(value: Value) -> Result<Value> {
         return Err(KalamError::Native {
             error_type: error_type.to_owned(),
             message: message.to_owned(),
+            data: object.get("data").filter(|data| !data.is_null()).cloned(),
         });
     }
     if !object.contains_key("data") {
@@ -569,3 +697,5 @@ static FREED_PAYLOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod transfer_tests;

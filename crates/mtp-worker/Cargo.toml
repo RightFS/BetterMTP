@@ -9,6 +9,7 @@ license.workspace = true
 mtp-backend-api.workspace = true
 mtp-backend-kalam.workspace = true
 mtp-domain.workspace = true
+mtp-transfer.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

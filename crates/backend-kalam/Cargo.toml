@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 libloading = "=0.8.9"
+libc = "=0.2.191"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

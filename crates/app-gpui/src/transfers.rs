@@ -19,6 +19,7 @@ pub(crate) enum TransferPlan {
     Download {
         source: RemoteRef,
         source_name: String,
+        source_address: String,
         destination: PathBuf,
         policy: FileConflictPolicy,
     },
@@ -60,10 +61,14 @@ impl TransferPlan {
             Self::Download {
                 destination,
                 source_name,
+                source_address,
                 ..
             } => format!(
-                "捕获下载目标: {} · 源: {source_name}",
-                destination.to_string_lossy()
+                "捕获下载目标: {} · 源: {}{}{}",
+                destination.to_string_lossy(),
+                source_address.trim_end_matches('/'),
+                if source_address.is_empty() { "" } else { "/" },
+                source_name
             ),
         }
     }
@@ -106,11 +111,19 @@ pub(crate) struct PendingTransfer {
     pub(crate) plan: TransferPlan,
 }
 
+pub(crate) struct TransferRecord {
+    pub(crate) id: u64,
+    pub(crate) target: Option<String>,
+    pub(crate) outcome: TransferOutcome,
+}
+
 pub(crate) struct TransferState {
     pub(crate) cache: Option<PathBuf>,
     pub(crate) pending: Option<PendingTransfer>,
     last_target: Option<String>,
     pub(crate) terminal: Option<TransferOutcome>,
+    pub(crate) preflight_notice: Option<String>,
+    pub(crate) recent: std::collections::VecDeque<TransferRecord>,
     pub(crate) requires_review: bool,
     pub(crate) download_policy: FileConflictPolicy,
     next_id: u64,
@@ -124,6 +137,8 @@ impl TransferState {
             pending: None,
             last_target: None,
             terminal: None,
+            preflight_notice: None,
+            recent: std::collections::VecDeque::new(),
             requires_review: false,
             download_policy: FileConflictPolicy::KeepBoth,
             next_id: 0,
@@ -148,8 +163,16 @@ impl TransferState {
             self.exhausted = true;
             return Err("传输任务编号已耗尽，请重新启动应用。");
         };
+        if let Some(outcome) = self.terminal.take() {
+            self.recent.push_front(TransferRecord {
+                id: self.next_id,
+                target: self.last_target.take(),
+                outcome,
+            });
+            self.recent.truncate(8);
+        }
         self.next_id = id;
-        self.terminal = None;
+        self.preflight_notice = None;
         self.last_target = None;
         self.pending = Some(PendingTransfer { id, plan });
         Ok(id)
@@ -178,12 +201,7 @@ impl TransferState {
 
     pub(crate) fn reject(&mut self, message: &str) {
         if !self.busy() && !self.requires_review {
-            self.terminal = Some(TransferOutcome::Failed {
-                message: message.into(),
-                requires_review: false,
-                journal_path: None,
-            });
-            self.last_target = None;
+            self.preflight_notice = Some(message.into());
         }
     }
 
@@ -213,6 +231,12 @@ impl TransferState {
             ),
             Some(TransferOutcome::Skipped) => {
                 "Skipped / 已跳过：目标存在，未覆盖；不是 Success。".into()
+            }
+            Some(TransferOutcome::Failed {
+                requires_review: true,
+                ..
+            }) if !self.requires_review => {
+                "已人工确认核对 · 请手动重新连接；原任务结果仍未知，未自动重试。".into()
             }
             Some(TransferOutcome::Failed {
                 message,
@@ -309,6 +333,7 @@ mod tests {
                 mtp_domain::ObjectId(3),
             ),
             source_name: "file.txt".into(),
+            source_address: String::new(),
             destination: PathBuf::from(destination),
             policy: FileConflictPolicy::KeepBoth,
         }
@@ -319,6 +344,127 @@ mod tests {
             Ok(id) => id,
             Err(_) => panic!("unexpected task rejection"),
         }
+    }
+
+    fn completed_state() -> TransferState {
+        fn path(value: &str) -> mtp_backend_api::LocalPath {
+            match mtp_backend_api::LocalPath::from_path(Path::new(value)) {
+                Ok(path) => path,
+                Err(_) => panic!("invalid fixture path"),
+            }
+        }
+        let mut state = TransferState::new(None);
+        let id = begin(&mut state, download("/captured"));
+        assert!(state.complete(
+            id,
+            TransferOutcome::Completed(TransferReceipt {
+                direction: TransferDirection::Download,
+                actual_name: "actual.txt".into(),
+                bytes: 17,
+                object_id: Some(3),
+                local_path: Some(path("/captured/actual.txt")),
+                journal_path: path("/captured/stage/journal.json"),
+            })
+        ));
+        state
+    }
+
+    #[test]
+    fn rejected_action_and_id_exhaustion_never_erase_completed_evidence() {
+        let mut state = completed_state();
+        let target = state.target_summary();
+        state.reject("directory upload is unsupported");
+        assert_eq!(
+            state.preflight_notice.as_deref(),
+            Some("directory upload is unsupported")
+        );
+        assert!(
+            matches!(&state.terminal, Some(TransferOutcome::Completed(receipt)) if receipt.actual_name == "actual.txt" && receipt.bytes == 17)
+        );
+        assert_eq!(
+            state.published_path(),
+            Some(PathBuf::from("/captured/actual.txt"))
+        );
+        assert_eq!(
+            state.journal(),
+            Some(PathBuf::from("/captured/stage/journal.json"))
+        );
+        assert_eq!(state.target_summary(), target);
+        state.next_id = u64::MAX;
+        assert!(state.begin(download("/not-started")).is_err());
+        state.reject("exhausted; restart required");
+        assert!(matches!(
+            state.terminal,
+            Some(TransferOutcome::Completed(_))
+        ));
+        assert_eq!(state.target_summary(), target);
+        assert!(state.journal().is_some());
+        assert!(state.recent.is_empty());
+    }
+
+    #[test]
+    fn new_task_archives_display_only_receipt_and_captured_target() {
+        let mut state = completed_state();
+        let old_target = state.target_summary();
+        let id = begin(&mut state, download("/next-target"));
+        assert_eq!(id, 2);
+        assert!(state.terminal.is_none());
+        assert_eq!(state.recent.len(), 1);
+        let Some(record) = state.recent.front() else {
+            panic!("missing evidence record");
+        };
+        assert_eq!(record.id, 1);
+        assert_eq!(record.target, old_target);
+        assert!(
+            matches!(&record.outcome, TransferOutcome::Completed(receipt) if receipt.actual_name == "actual.txt" && receipt.journal_path.to_path_buf() == Path::new("/captured/stage/journal.json"))
+        );
+        assert!(state.complete(id, TransferOutcome::Skipped));
+        assert!(state.summary().contains("Skipped"));
+        assert!(matches!(
+            &state.recent[0].outcome,
+            TransferOutcome::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn explicit_ack_does_not_change_unknown_outcome_or_its_evidence() {
+        let mut state = TransferState::new(None);
+        let id = begin(&mut state, download("/captured"));
+        assert!(state.complete(
+            id,
+            TransferOutcome::Failed {
+                message: "unknown".into(),
+                requires_review: true,
+                journal_path: Some(PathBuf::from("/captured/journal.json"))
+            }
+        ));
+        let target = state.target_summary();
+        assert!(state.acknowledge_review());
+        assert!(state.summary().contains("已人工确认"));
+        assert!(matches!(
+            &state.terminal,
+            Some(TransferOutcome::Failed {
+                requires_review: true,
+                ..
+            })
+        ));
+        state.reject("unrelated invalid click");
+        assert_eq!(state.target_summary(), target);
+        assert_eq!(
+            state.journal(),
+            Some(PathBuf::from("/captured/journal.json"))
+        );
+    }
+
+    #[test]
+    fn recent_records_are_bounded_without_any_filesystem_cleanup() {
+        let mut state = completed_state();
+        for _ in 0..12 {
+            let id = begin(&mut state, download("/captured"));
+            assert!(state.complete(id, TransferOutcome::Skipped));
+        }
+        assert_eq!(state.recent.len(), 8);
+        assert!(matches!(state.terminal, Some(TransferOutcome::Skipped)));
     }
 
     #[test]

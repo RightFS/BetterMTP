@@ -110,3 +110,11 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo run --locked -p a
 本轮后续 **232 项核心测试全部通过**，默认核心 strict all-targets Clippy、fmt 与 diff 检查退出0。其中 adapter 6 个顶层测试包含原 FD 45 与 inspect 25 个 fresh subprocess 情景；probe 20 个纯 guard/脱敏/report 比较测试。Go race/vet、arm64 ABI smoke/签名均离线通过；独立 inspect 及 report 比较尚未实际在手机执行。SDK 裸 Open fallback2s，但固定 go-mtpx 初始化覆盖为15s；本轮未调整 timeout、未削弱全局旧 ID 检查。
 
 用户最新要求 **停止全部真机/USB验证，先完善交互与 UI，明天回来验证手机**。此后只允许离线回归和显式 local-only 原生窗口；不再次上传/只读访问手机、不清理历史证据、不自动恢复或重试。整体目录传输及真机双向/大文件验收仍未完成。
+
+## UI 交互完善后的父会话回归
+
+- 232 核心 + 40 GPUI 受控测试全部通过；完整 workspace all-targets strict Clippy、fmt、构建（app/worker/probe）、fake/local 探针、diff check 的组合命令退出0。
+- UI 修复：无效点击不抹去完成证据、仅展示型近期历史、单次 context ticket 防旧菜单回调误作用新目标、StorageId+epoch 防重连或存储重排选错目标；新增原始身份面包屑、键盘选择/目录导航、方向能力与源目标预览、底部可展开证据及独立 RequiresReview 人工确认。
+- 以 `env -u MTP_KALAM_LIBRARY target/debug/app-gpui --local-only` 启动本会话拥有的原生窗口。CoreGraphics 仅查询 app-gpui 自己的窗口元数据：PID23784、window2521、onscreen=true、外框1100×732；同时系统进程名称计数 `MTP_WORKER_PROCESS_COUNT=0`。这只证明窗口存在与未启动 worker，不证明文字/像素、最小窗口布局、键鼠或剪贴板交互已实测。
+- 本轮未捕获屏幕、未再次申请或绕过系统截图权限，未启动设备连接。随后关闭本会话的仅本地测试窗口，不操作其他应用进程。min800×500、长路径、IME、真实右键/焦点/剪贴板与视觉检查保留未验收。
+- 启动隔离及人工步骤见 [UI 交互说明](ui-interaction.md) 与 [预览检查清单](ui-preview-checklist.md)。CI 和 `scripts/check.sh --ui` 增加 app test 与 strict Clippy，不再仅以 check/build 当作 UI 回归通过。

@@ -30,5 +30,7 @@ if [[ "${1:-}" == "--ui" ]]; then
         xcrun metal --version
     fi
     cargo check --locked -p app-gpui
+    cargo test --locked -p app-gpui
+    cargo clippy --locked -p app-gpui --all-targets -- -D warnings
     cargo build --locked -p app-gpui
 fi

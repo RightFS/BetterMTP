@@ -17,6 +17,7 @@ use mtp_domain::{RemoteDirectoryRef, RemoteRef, StorageId};
 
 #[derive(Clone)]
 pub(crate) enum RemoteConfig {
+    LocalOnly,
     Unconfigured,
     Invalid(String),
     Ready {
@@ -71,6 +72,10 @@ impl RemoteConfig {
         exe: Option<PathBuf>,
         resource_is_file: impl FnOnce(&std::path::Path) -> bool,
     ) -> Self {
+        let args = args.into_iter().collect::<Vec<_>>();
+        if args.iter().any(|arg| arg == "--local-only") {
+            return Self::LocalOnly;
+        }
         let explicit = match parse_library(args, env) {
             Ok(library) => library,
             Err(error) => return Self::Invalid(error),
@@ -115,6 +120,7 @@ impl RemoteConfig {
 
     pub(crate) fn message(&self) -> &'static str {
         match self {
+            Self::LocalOnly => "仅本地交互预览 · --local-only 优先 · 不启动 worker / 不访问 USB",
             Self::Unconfigured => "尚未配置 · 使用 --library ABS 或 MTP_KALAM_LIBRARY",
             Self::Invalid(_) => "设备配置无效 · 请修正启动参数后重启",
             Self::Ready { .. } => "Kalam 已配置 · 尚未连接设备",
@@ -250,6 +256,9 @@ impl RemoteBrowser {
     }
 
     pub(crate) fn begin(&mut self, command: &RemoteCommand) -> Option<u64> {
+        if matches!(self.config, RemoteConfig::LocalOnly) {
+            return None;
+        }
         if self.shared.closed.load(Ordering::SeqCst) {
             return None;
         }
@@ -599,6 +608,49 @@ pub(crate) fn run_transfer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_only_overrides_all_configuration_without_resource_probe() {
+        let config = RemoteConfig::from_inputs(
+            [
+                OsString::from("--library"),
+                OsString::from("/must-not-load.dylib"),
+                OsString::from("--local-only"),
+            ],
+            Some(OsString::from("/also-must-not-load.dylib")),
+            Some(PathBuf::from("/bundles/Test.app/Contents/MacOS/app-gpui")),
+            |_| panic!("local-only must not probe bundle resources"),
+        );
+        assert!(matches!(config, RemoteConfig::LocalOnly));
+        let malformed = RemoteConfig::from_inputs(
+            [OsString::from("--local-only"), OsString::from("--library")],
+            None,
+            None,
+            |_| panic!("local-only must not probe resources"),
+        );
+        assert!(matches!(malformed, RemoteConfig::LocalOnly));
+        assert!(config.message().contains("不启动 worker"));
+    }
+
+    #[test]
+    fn local_only_refuses_every_epoch_before_any_worker_dispatch() {
+        let mut browser = RemoteBrowser::new(RemoteConfig::LocalOnly);
+        let configured = RemoteCommand::Connect(RemoteConfig::Ready {
+            worker_path: PathBuf::from("/must-not-execute"),
+            library_path: PathBuf::from("/must-not-load.dylib"),
+        });
+        assert!(browser.begin(&configured).is_none());
+        assert!(browser.begin(&RemoteCommand::Disconnect).is_none());
+        assert_eq!(browser.transfer_epoch(), 0);
+        assert!(!browser.loading);
+        assert!(browser.session.is_none());
+        assert_eq!(browser.shared.desired.load(Ordering::SeqCst), 0);
+        let slot = match browser.shared.slot.lock() {
+            Ok(slot) => slot,
+            Err(_) => panic!("poisoned fixture lock"),
+        };
+        assert!(slot.is_none());
+    }
 
     #[test]
     fn process_stop_does_not_need_the_busy_worker_slot() {

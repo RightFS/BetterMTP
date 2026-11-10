@@ -66,6 +66,10 @@ impl LocalBrowser {
         true
     }
 
+    pub(crate) fn snapshot_revision(&self) -> u64 {
+        self.revision
+    }
+
     pub(crate) fn selected_entry(&self) -> Option<&LocalEntry> {
         let selected = self.selected.as_ref()?;
         self.entries.iter().find(|entry| &entry.path == selected)

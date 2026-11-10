@@ -27,8 +27,10 @@ cargo run --locked -p mtp-probe -- fake
 
 # 需要真实可用的 Xcode Metal Toolchain
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer bash scripts/check.sh --ui
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo run --locked -p app-gpui
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo run --locked -p app-gpui -- --local-only
 
+# --local-only 优先于环境变量、--library 和 bundle Resources；不启动 worker、不访问 USB
+# 明确恢复真机验证后才使用以下命令：
 # 同目录需要 mtp-worker；动态库为明确选定的本地编译产物
 # 仅设置真实 backend，不会偷偷切成 fake
 # Android 必须已解锁并切换到文件传输/MTP
@@ -42,7 +44,7 @@ Cargo 不在 PATH 时先 `export PATH="$HOME/.cargo/bin:$PATH"`。初始开发�
 
 ## 开发状态
 
-这是技术验证工程，不是已经可用的手机传输产品。真实 MTP 写入在安全 ABI、许可及真机测试完成前不开放。阶段能力和命令随可运行实现更新；不把 fake backend 测试等同于真机通过。
+这是受限的本地开发预览，不是已完成验收的手机传输产品。可信 FD ABI v2 已接线安全单文件操作；三星 SM-S9280 的真实只读浏览通过，但首次 128KiB 上传超时，原 NeedsReview、快照与 journal 保留，没有自动重试或清理。用户要求本阶段暂停全部手机/USB访问、先完善 UI，真机验收等用户明确恢复后再继续。离线 fixture、GPUI test context、窗口启动与手机双向验收是不同门禁，不能互相替代。
 
 ## 架构边界
 

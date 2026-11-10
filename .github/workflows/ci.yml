@@ -31,9 +31,11 @@ jobs:
         run: |
           xcodebuild -version
           xcrun metal --version
-      - name: Build native GPUI shell
+      - name: Verify native GPUI build and offline interaction tests
         run: |
           cargo check --locked -p app-gpui
+          cargo test --locked -p app-gpui
+          cargo clippy --locked -p app-gpui --all-targets -- -D warnings
           cargo build --locked -p app-gpui
       # Deliberately not continue-on-error: missing Metal is a failed UI gate,
       # not evidence that an uncompiled shell is a working application.

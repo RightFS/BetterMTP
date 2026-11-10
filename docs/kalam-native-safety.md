@@ -137,9 +137,12 @@ go-mtpx 固定提交 `18f12db021cc`：
   事后 inode 检查无法撤销这些写入。private stage pathname 本身也不够。
 
 所以首 MVP **禁 Replace、禁原名 rename commit**。旧 UploadFiles、RenameFile、
-DeleteFile exports 保留符号但一律拒绝。MakeDirectory 保留 bool，不提供对象
-ownership，不能拿它做 destructive cleanup。旧 DownloadFiles 已改同步 callback
-但仍是兼容 legacy，不获安全背书；Rust 永不调用它。safe transfer interface
+DeleteFile exports 保留符号但一律拒绝。旧 DownloadFiles 和 MakeDirectory 同样
+**fail closed**：保留 ABI/symbol，立即返回 `errorType:"ErrorUnsupported"`、
+`data:null`，不解析 input、不发 preprocess/progress，不访问设备/本地文件系统。
+没有可调用的 ambient-path mkdir/download 写入口，Rust 不得 fallback。
+未来目录创建须通过独立 owned-object/ID API 返回可验证 ownership；SDK底层
+helper 仅供未来安全对象接口开发，不构成已开放功能。safe transfer interface
 没有 delete/rename/路径创建方法，避免意外回退。
 
 ### 原子性与剩余限制
@@ -191,8 +194,13 @@ install ID，再 ad-hoc sign。输入的架构、版本和来源由开发者明�
   同名替换换ID时不Create/Send、FD下载路径被换为 symlink
   不触碰victim、超长/短数据、非空stage/目录拒绝；未调用 upstream 真机测试。
 - [C smoke](../native/kalam/tests/abi_smoke.c) 验证 FD符号/ABI、marker=2、400次
-  跨4pthread callback串行且立即free、1000空 callback 与禁止覆盖调用；不 Initialize
+  跨4pthread callback串行且立即free、1000空 callback 与禁止覆盖调用；还验证
+  legacy DownloadFiles/MakeDirectory 返回明确 Unsupported、不发中间回调、
+  local sentinel 内容不变且目标child未创建。此 NoWrite fixture 不 Initialize
   设备，不执行真传输，Go runtime 留到进程退出不 dlclose。
+- 最后一次 legacy DownloadFiles/MakeDirectory 禁用后的 arm64 Kalam local binary
+  SHA256：`c68a33c62e8c5eba0b1eda9da8f73d25573ce139a4e5fb663a780d942cbc34ea`。
+  接线/本地打包必须使用此次重建产物，不能沿用 earlier marker2 binary。
 - 原 libusb local input SHA256：
   `e69759d341ebe6bcd25d41c9bc6b0a2d2d07893dac5dd370391955bc7296d8ec`。
   header SHA256：`a61260ab145b051b86df2b0575956f01810190abe2c7df6aca831c33bdc8082c`。

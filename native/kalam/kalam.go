@@ -92,22 +92,7 @@ func FetchStorages(cb *C.on_cb_result_t) {
 func MakeDirectory(input *C.char, cb *C.on_cb_result_t) {
 	operationMu.Lock()
 	defer operationMu.Unlock()
-	done := (*send_to_js.SendCbResult)(cb)
-	var i MakeDirectoryInput
-	if err := json.Unmarshal([]byte(C.GoString(input)), &i); err != nil {
-		send_to_js.SendError(done, err)
-		return
-	}
-	if err := validateRemotePath(i.FullPath); err != nil {
-		send_to_js.SendError(done, err)
-		return
-	}
-	if err := _makeDirectory(i.StorageId, i.FullPath); err != nil {
-		send_to_js.SendError(done, err)
-		return
-	}
-	// Boolean legacy result conveys no ownership of the directory.
-	send_to_js.SendMakeDirectory(done)
+	send_to_js.SendValue((*send_to_js.SendCbResult)(cb), send_to_js.ErrorResult{ErrorType: "ErrorUnsupported", Error: "legacy MakeDirectory is disabled; an owned directory-object API is required"})
 }
 
 //export FileExists
@@ -244,44 +229,14 @@ func SafeDownloadSingle(input *C.char, outputFD C.int, progress, cb *C.on_cb_res
 	send_to_js.SendValue(done, envelope)
 }
 
-// Compatibility only: ambient-path download remains unsafe against rebinding.
-// Rust MUST NOT call it; use SafeDownloadSingle with an owned staging FD.
+// Legacy ambient-path download is disabled, including parsing and callbacks.
+// Use SafeDownloadSingle with an owned staging FD; no fallback is permitted.
 //
 //export DownloadFiles
 func DownloadFiles(input *C.char, pre, progress, cb *C.on_cb_result_t) {
 	operationMu.Lock()
 	defer operationMu.Unlock()
-	done := (*send_to_js.SendCbResult)(cb)
-	var i DownloadFilesInput
-	if err := json.Unmarshal([]byte(C.GoString(input)), &i); err != nil {
-		send_to_js.SendError(done, err)
-		return
-	}
-	for _, p := range i.Sources {
-		if err := validateRemotePath(p); err != nil {
-			send_to_js.SendError(done, err)
-			return
-		}
-	}
-	err := _downloadFiles(i.StorageId, i.Sources, i.Destination, i.PreprocessFiles,
-		func(fi *mtpx.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			send_to_js.SendDownloadFilesPreprocess((*send_to_js.SendCbResult)(pre), fi)
-			return nil
-		}, func(p *mtpx.ProgressInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			send_to_js.SendTransferFilesProgress((*send_to_js.SendCbResult)(progress), p)
-			return nil
-		})
-	if err != nil {
-		send_to_js.SendError(done, err)
-		return
-	}
-	send_to_js.SendTransferFilesDone(done)
+	send_to_js.SendValue((*send_to_js.SendCbResult)(cb), send_to_js.ErrorResult{ErrorType: "ErrorUnsupported", Error: "legacy DownloadFiles is disabled; use SafeDownloadSingle with an owned staging FD"})
 }
 
 //export Dispose

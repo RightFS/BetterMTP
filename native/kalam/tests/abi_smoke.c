@@ -7,15 +7,24 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 typedef void (*callback)(char *);
+typedef void (*json_done_fn)(char *, callback *);
 // Legacy ABI uses a function address cast to callback*, not &callback.
 typedef void (*done_fn)(callback *);
 typedef void (*transfer_fn)(char *, callback *, callback *, callback *);
 typedef void (*upload_fd_fn)(char *, int, callback *, callback *, callback *);
 typedef void (*download_fd_fn)(char *, int, callback *, callback *);
 static done_fn dispose_fn;
-static atomic_int callbacks, active, overlap, errors;
+static atomic_int callbacks, active, overlap, errors, unsupported_calls;
+static void unsupported(char *json) {
+    if (!json || !strstr(json, "\"errorType\":\"ErrorUnsupported\"") || !strstr(json,"\"data\":null")) atomic_fetch_add(&errors,1);
+    atomic_fetch_add(&unsupported_calls,1);
+    free(json);
+}
+static void unexpected_progress(char *json) { atomic_fetch_add(&errors,1); free(json); }
 static void result(char *json) {
     if (atomic_fetch_add(&active, 1) != 0) atomic_store(&overlap, 1);
     if (!json || !strstr(json, "\"data\":true")) atomic_fetch_add(&errors, 1);
@@ -42,7 +51,25 @@ int main(int argc, char **argv) {
     upload_fd_fn safe = (upload_fd_fn)dlsym(lib, "SafeUploadSingle");
     download_fd_fn download = (download_fd_fn)dlsym(lib, "SafeDownloadSingle");
     transfer_fn legacy = (transfer_fn)dlsym(lib, "UploadFiles");
-    if (!version || version() != 2 || !dispose_fn || !safe || !download || !legacy || !dlsym(lib,"DownloadFiles")) return 1;
+    transfer_fn legacy_download = (transfer_fn)dlsym(lib,"DownloadFiles");
+    json_done_fn legacy_mkdir = (json_done_fn)dlsym(lib,"MakeDirectory");
+    if (!version || version() != 2 || !dispose_fn || !safe || !download || !legacy || !legacy_download || !legacy_mkdir) return 1;
+    char fixture[]=".cache/kalam/arm64/no-write-XXXXXX";
+    if (!mkdtemp(fixture)) return 1;
+    char sentinel[512], child[512], download_json[1024], mkdir_json[1024];
+    snprintf(sentinel,sizeof(sentinel),"%s/sentinel",fixture);
+    snprintf(child,sizeof(child),"%s/must-not-exist",fixture);
+    FILE *f=fopen(sentinel,"wb");
+    if (!f || fwrite("DO NOT TOUCH",1,12,f)!=12 || fclose(f)) return 1;
+    snprintf(download_json,sizeof(download_json),"{\"storageId\":1,\"sources\":[\"/sentinel\"],\"destination\":\"%s\",\"preprocessFiles\":true}",fixture);
+    snprintf(mkdir_json,sizeof(mkdir_json),"{\"storageId\":1,\"fullPath\":\"%s\"}",child);
+    legacy_download(download_json,(callback *)unexpected_progress,(callback *)unexpected_progress,(callback *)unsupported);
+    legacy_mkdir(mkdir_json,(callback *)unsupported);
+    char preserved[16]={0};
+    f=fopen(sentinel,"rb");
+    if (!f || fread(preserved,1,sizeof(preserved),f)!=12 || fclose(f) || memcmp(preserved,"DO NOT TOUCH",12)) return 1;
+    struct stat child_stat;
+    if (stat(child,&child_stat)==0 || errno!=ENOENT || atomic_load(&unsupported_calls)!=2) return 1;
     legacy("{}", NULL, NULL, (callback *)forbidden);
     safe("{\"policy\":\"replace\",\"parentId\":null}", -1, NULL, NULL, (callback *)forbidden);
     // Absent callbacks must free CString in the native shim.
@@ -51,7 +78,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 4; ++i) if (pthread_create(&threads[i], NULL, thread_main, NULL)) return 1;
     for (int i = 0; i < 4; ++i) pthread_join(threads[i], NULL);
     if (atomic_load(&callbacks) != 400 || atomic_load(&overlap) || atomic_load(&errors)) return 1;
-    puts("PASS: dlopen, SafetyVersion=2, symbols, 400 serialized callbacks/free, null callbacks, unsafe upload rejection; NO DEVICE TRANSFER TEST");
+    puts("PASS: dlopen, SafetyVersion=2, symbols, 400 serialized callbacks/free, null callbacks, unsafe upload rejection, legacy DownloadFiles/MakeDirectory Unsupported and NoWrite; NO DEVICE TRANSFER TEST");
     // Go runtime remains loaded until process exit; do not dlclose a Go library.
     return 0;
 }

@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/domain", "crates/backend-api", "crates/local-fs", "crates/mtp-worker", "crates/probe", "crates/app-gpui"]
+default-members = ["crates/domain", "crates/backend-api", "crates/local-fs", "crates/mtp-worker", "crates/probe"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+thiserror = "=2.0.17"
+mtp-domain = { path = "crates/domain" }
+mtp-backend-api = { path = "crates/backend-api" }
+mtp-local-fs = { path = "crates/local-fs" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

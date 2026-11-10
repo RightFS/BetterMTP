@@ -130,8 +130,8 @@ impl FakeSession {
                         Ok(Value::Entries { entries })
                     }
                     Operation::Disconnect => {
-                        self.advance()?;
                         self.connected = false;
+                        self.advance()?;
                         Ok(Value::Disconnected)
                     }
                     Operation::InjectFailure { fault } => {
@@ -151,8 +151,10 @@ impl FakeSession {
                             ),
                         };
                         if review {
-                            self.advance()?;
                             self.connected = false;
+                            // Exhaustion must not change an uncertain result or make
+                            // its session usable; reconnect still fails without wrap.
+                            let _ = self.advance();
                         }
                         Err(self.error(code, message, review))
                     }
@@ -290,6 +292,48 @@ mod tests {
             Outcome::Failure { .. }
         ));
         assert!(!s.connected);
+    }
+    #[test]
+    fn exhausted_generation_still_invalidates_session() {
+        for operation in [
+            Operation::Disconnect,
+            Operation::InjectFailure {
+                fault: Fault::UnknownOutcome,
+            },
+        ] {
+            let mut s = FakeSession {
+                generation: u64::MAX,
+                connected: true,
+            };
+            let outcome = s.execute(&command(1, Some(u64::MAX), operation.clone()));
+            assert!(matches!(
+                &outcome,
+                Outcome::Failure {
+                    error: BackendError {
+                        session_usable: false,
+                        ..
+                    }
+                }
+            ));
+            if matches!(operation, Operation::InjectFailure { .. }) {
+                assert!(matches!(
+                    outcome,
+                    Outcome::Failure {
+                        error: BackendError {
+                            code: ErrorCode::UnknownOutcome,
+                            requires_review: true,
+                            ..
+                        }
+                    }
+                ));
+            }
+            assert!(!s.connected);
+            assert_eq!(s.generation(), u64::MAX);
+            assert!(matches!(
+                s.execute(&command(2, None, Operation::Connect)),
+                Outcome::Failure { .. }
+            ));
+        }
     }
     #[test]
     fn terminal_once_and_shutdown_closes_loop() {

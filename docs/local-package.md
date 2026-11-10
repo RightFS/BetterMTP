@@ -87,6 +87,7 @@ open '/absolute/path/to/<uuid>-MTP-Native.app'
 
 优先级为：
 
+0. **`--local-only` 最高优先**：忽略所有 library/env/bundle 配置，不探测资源、不启动 worker、不访问手机或 USB；本阶段 UI 预览必须用此参数。
 1. 明确 `--library ABSOLUTE_PATH`。
 2. 明确非空 `MTP_KALAM_LIBRARY`。
 3. 仅当前可执行文件位于 `*.app/Contents/MacOS/app-gpui` 时，检查 **自身** `Contents/Resources/kalam.dylib` 普通文件（不自动跟随 resource symlink）。
@@ -123,7 +124,23 @@ startup resolution 提供可注入 args/env/exe/resource-check 的纯函数，�
 
 同一包内 worker 与 Resources 库执行真实只读探针，成功识别三星 SM-S9280、两 storage 根目录并 clean shutdown，退出 0、不写文件。用户随后授权主存储 `/tmp` 独立小文件测试；后续真实写验收另见 [验收文档](device-acceptance.md)，须以实际结果为准，当前不能由打包成功推断双向传输已通过。
 
-## 父代理验收清单
+## UI 交互开发包复核（当前里程碑）
+
+代码基线为 `1e45f2e`（UI/交互）与 `369d0f1`（dispatch/诊断安全修复）。232 核心 + 40 GPUI 受控测试、完整 workspace strict Clippy、fmt/build 与 fake/local 探针全部通过；具体未验收边界见 [验证记录](validation.md#ui-交互完善后的父会话回归)。
+
+使用该 UI 代码构建并执行 `--skip-build --ad-hoc-sign --zip`，生成全新 `55caee1f-d8e3-4dab-ac42-cad4b05d0739-MTP-Native.app` 与本地 ZIP；不覆盖任何旧包。最低 macOS 26.0、thin arm64，本地 ad-hoc 签名，不是 Developer ID／notarized／许可已清理的正式发行。
+
+后续目标轮次再次实际复核：`codesign --verify --deep --strict` 通过，`unzip -tq` 无压缩数据错误，ZIP SHA-256 为：
+
+```text
+20ff49ad649e772d10f8609c965cac329ada1875be750704e95af40badb4afbf
+```
+
+校验对应 repo 内 `target/bundles/55caee1f-d8e3-4dab-ac42-cad4b05d0739-MTP-Native.app.zip`。这里只检查本机已有文件，没有运行该包、连接手机、读取 UID、执行 inspect 或重试旧失败上传。
+
+父会话以裸 binary 的 `--local-only` 实际开窗，查询到 onscreen 外框1100×732且 MTP worker 数量0，随后关闭自己的窗口。这个证据不等于 Finder／键鼠／最小窗口／剪贴板／IME／像素视觉或手机传输通过。预览必须明确 local-only；手机验证继续等用户恢复授权。原 RequiresReview、报告、快照与 journal 未被改写或清理。
+
+## 初期父代理验收清单（历史 slice，非当前待办列表）
 
 - [ ] 统一 `cargo test -p app-gpui`（原 10 + 新 4）、clippy 与 debug app/worker build，通过后再打包。
 - [ ] 执行 `bash scripts/package-local.sh --skip-build --ad-hoc-sign`，检查 app 结构、plist lint、真实 minimum OS、native paths、签名验证及 hashes；脚本最后成功状态不等同真机验证。

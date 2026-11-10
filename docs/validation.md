@@ -98,3 +98,15 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo run --locked -p a
 短 native timeout 测试现在用正常 20s handshake budget，握手成功后才设置 1s native 调用 budget；原先将短预算用于并行 fixture 预加载/握手会偶发在测试目标调用之前超时。这不是放宽实际 stalled call 断言：Initialize 仍故意停顿 2s、必须被杀并且 session 不可复用。
 
 这些是受控 SDK/IPC/文件系统回归，**不是实际 Android 传输通过**。当前仅普通单文件，不递归目录、不 Replace、不伪造 USB Cancel；执行中的真实字节进度尚未转成 UI 百分比，只展示处理中和已验证结果。目录树、重启后 journal 核对 UX、真实设备/大文件、视觉/IME/拖放及发行授权仍待后续迭代。
+
+### 随后连接真实设备：三星 SM-S9280
+
+新开发包的 Resources 库与 MacOS worker（不是 target 下替代进程或 fixture）执行只读 `mtp-probe kalam`，退出 **0**。识别到 `samsung SM-S9280`，主内部存储 **65537** 根目录 65 项，应用分身存储 **65538** 根目录 13 项；初始化、存储枚举、根浏览及 clean shutdown 通过，未打印设备序列号、未写或传输文件。上文 `no MTP devices found` 为连接手机之前的历史结果，不再代表当前状态。
+
+用户随后明确授权测试目录 `/内部存储/tmp/`，映射主存储 65537 的 `/tmp`。测试必须先发现已有 tmp 目录及对象 ID；不得缺失时改用根目录、不新建手机目录、不覆盖删除原有文件、不自动 retry/cleanup。受限双向小文件 CLI 的首次真实 128KiB 上传返回 `ErrorGeneral / LIBUSB_ERROR_TIMEOUT`，程序退出 3、RequiresReview，后续下载、Skip、KeepBoth、零字节步骤均未执行。原快照、结果报告及 journal 保留，没有自动重试或删除。超时后首次只读核对返回 ErrorNoStorage；用户重新连接后只读 `/tmp` 恢复成功，ID55/count1 与之前一致，但只计数一致不能证明全部原元数据/文件内容不变，也不清除未知结果。
+
+后续静态审计修复了上传 durable dispatch gap：旧版本失败 journal 的 `native_dispatched=false` 不能视作没有进入 USB 的证据，历史文件不改写；新版本 USB 前必须 `mark_dispatched()` durable 保存 true，失败不得调用 native。新增 8 项事务回归，macOS 本地事务现 76 项通过。native 增加私有静态 phase/op 和独立只读 inspect API，后者不调用上传 dryRun、无 Create/Send/目录写能力；仍不代表旧 unknown 已恢复。
+
+本轮后续 **232 项核心测试全部通过**，默认核心 strict all-targets Clippy、fmt 与 diff 检查退出0。其中 adapter 6 个顶层测试包含原 FD 45 与 inspect 25 个 fresh subprocess 情景；probe 20 个纯 guard/脱敏/report 比较测试。Go race/vet、arm64 ABI smoke/签名均离线通过；独立 inspect 及 report 比较尚未实际在手机执行。SDK 裸 Open fallback2s，但固定 go-mtpx 初始化覆盖为15s；本轮未调整 timeout、未削弱全局旧 ID 检查。
+
+用户最新要求 **停止全部真机/USB验证，先完善交互与 UI，明天回来验证手机**。此后只允许离线回归和显式 local-only 原生窗口；不再次上传/只读访问手机、不清理历史证据、不自动恢复或重试。整体目录传输及真机双向/大文件验收仍未完成。

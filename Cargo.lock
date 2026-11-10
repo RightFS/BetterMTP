@@ -3319,6 +3319,7 @@ dependencies = [
  "mtp-backend-api",
  "mtp-domain",
  "mtp-local-fs",
+ "serde_json",
 ]
 
 [[package]]

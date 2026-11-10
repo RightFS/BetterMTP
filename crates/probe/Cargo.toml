@@ -1,5 +1,6 @@
 [package]
 name = "mtp-probe"
+default-run = "mtp-probe"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +11,7 @@ mtp-backend-api.workspace = true
 mtp-local-fs.workspace = true
 mtp-application.workspace = true
 mtp-domain.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

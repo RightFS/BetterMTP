@@ -3,6 +3,7 @@ package main
 
 /*
 #include <stdint.h>
+#include <string.h>
 typedef void (*on_cb_result_t)(char*);
 */
 import "C"
@@ -168,6 +169,37 @@ func UploadFiles(input *C.char, pre, progress, cb *C.on_cb_result_t) {
 	send_to_js.SendError((*send_to_js.SendCbResult)(cb), fmt.Errorf("ErrorUnsafeOperation: legacy UploadFiles is disabled; use SafeUploadSingle keepBoth"))
 }
 
+// InspectUploadDestination is a read-only route, not an upload dry-run flag.
+//
+//export InspectUploadDestination
+func InspectUploadDestination(input *C.char, cb *C.on_cb_result_t) {
+	operationMu.Lock()
+	defer operationMu.Unlock()
+	done := (*send_to_js.SendCbResult)(cb)
+	if input != nil && C.strnlen(input, 4097) > 4096 {
+		err := fmt.Errorf("inspection input exceeds fixed size limit")
+		send_to_js.SendValue(done, inspectionEnvelope(inspectionDiagnostic("decodeInput", "BoundedInputJson", err), err))
+		return
+	}
+	var i InspectUploadDestinationInput
+	if err := json.Unmarshal([]byte(C.GoString(input)), &i); err != nil {
+		send_to_js.SendValue(done, inspectionEnvelope(inspectionDiagnostic("decodeInput", "json.Unmarshal", err), err))
+		return
+	}
+	if err := validateUploadDestinationRef(i.StorageId, i.Destination, i.ParentId, i.parentIdPresent); err != nil {
+		send_to_js.SendValue(done, inspectionEnvelope(inspectionDiagnostic("validateInput", "validateUploadDestinationRef", err), err))
+		return
+	}
+	// Quiet decoded SDK metadata, including session validation, under the lock.
+	defer suppressInspectionDebug(container.dev)()
+	if err := verifyMtpSession(verifyMtpSessionMode{}); err != nil {
+		send_to_js.SendValue(done, inspectionEnvelope(inspectionDiagnostic("verifySession", "FetchDeviceInfoAndVerifySession", err), err))
+		return
+	}
+	result, err := inspectUploadDestination(mtpUploadDevice{container.dev}, i)
+	send_to_js.SendValue(done, inspectionEnvelope(result, err))
+}
+
 //export SafeUploadSingle
 func SafeUploadSingle(input *C.char, sourceFD C.int, pre, progress, cb *C.on_cb_result_t) {
 	operationMu.Lock()
@@ -175,15 +207,15 @@ func SafeUploadSingle(input *C.char, sourceFD C.int, pre, progress, cb *C.on_cb_
 	done := (*send_to_js.SendCbResult)(cb)
 	var i SafeUploadInput
 	if err := json.Unmarshal([]byte(C.GoString(input)), &i); err != nil {
-		send_to_js.SendError(done, err)
+		send_to_js.SendErrorWithData(done, err, uploadDiagnostic("decodeInput", "json.Unmarshal", err))
 		return
 	}
 	if err := validateUploadInput(i); err != nil {
-		send_to_js.SendError(done, err)
+		send_to_js.SendErrorWithData(done, err, uploadDiagnostic("validateInput", "validateUploadInput", err))
 		return
 	}
 	if err := verifyMtpSession(verifyMtpSessionMode{}); err != nil {
-		send_to_js.SendError(done, err)
+		send_to_js.SendErrorWithData(done, err, uploadDiagnostic("verifySession", "FetchDeviceInfoAndVerifySession", err))
 		return
 	}
 	result, err := safeUpload(mtpUploadDevice{container.dev}, i, int(sourceFD), func(p *mtpx.ProgressInfo) {

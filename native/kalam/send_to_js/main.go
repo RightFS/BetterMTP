@@ -32,6 +32,11 @@ func SendValue(cb *SendCbResult, value interface{}) {
 	C.send_cb_result((*C.on_cb_result_t)(cb), C.CString(toJson(value)))
 }
 
+func SendErrorWithData(cb *SendCbResult, err error, data interface{}) {
+	errorType, errorMsg := processError(err)
+	SendValue(cb, ErrorResult{ErrorType: errorType, Error: errorMsg, Data: data})
+}
+
 func SendError(onDonePtr *SendCbResult, err error) {
 	errorType, errorMsg := processError(err)
 

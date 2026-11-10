@@ -117,6 +117,12 @@ startup resolution 提供可注入 args/env/exe/resource-check 的纯函数，�
 
 实测输出为本 repo `target/bundles/58e46906-653c-4d26-894b-458ac9bc4b5a-MTP-Native.app`，没有生成 ZIP、没有上传或公开发布。新 bundle Finder 启动、重复打包隔离、真机浏览/传输继续由后续验收补充。
 
+后续 FD 单文件版本（Rust 提交 `d010643`，legacy native 封口 `eb36d52`）完成 **200 core / 24 UI** 测试与严格 clippy 后，再执行 `--skip-build --ad-hoc-sign --zip`，退出 0。生成不同 UUID 的 `target/bundles/ca9b0c8f-025d-4c76-b5f5-d88f5727f222-MTP-Native.app` 及本地 ZIP，不覆盖前一个包，仍按四个 payload 检查 minOS **26.0**、依赖、cmp、hash 和深度签名。native 输入 hash 为 `c68a33c62e8c5eba0b1eda9da8f73d25573ce139a4e5fb663a780d942cbc34ea`。
+
+没有 env/CLI library override 的 bundle 内 executable 已实际启动；CoreGraphics 查询应用名 `MTP Native (Local Developer)`，可见窗口 **2340**，1100 × 732。旧只读窗口已关闭。此方式检验自身 bundle 路径资源配置，不应混称 LaunchServices/Finder 双击交互已经逐项手测；screen capture/IME/拖放也不因窗口可见而自动通过。
+
+同一包内 worker 与 Resources 库执行真实只读探针，成功识别三星 SM-S9280、两 storage 根目录并 clean shutdown，退出 0、不写文件。用户随后授权主存储 `/tmp` 独立小文件测试；后续真实写验收另见 [验收文档](device-acceptance.md)，须以实际结果为准，当前不能由打包成功推断双向传输已通过。
+
 ## 父代理验收清单
 
 - [ ] 统一 `cargo test -p app-gpui`（原 10 + 新 4）、clippy 与 debug app/worker build，通过后再打包。

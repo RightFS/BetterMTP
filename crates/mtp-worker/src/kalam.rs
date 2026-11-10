@@ -73,7 +73,11 @@ impl KalamSession {
             }
             _ => ErrorCode::BackendFailure,
         };
-        let mut output = self.error(code, error.to_string());
+        let message = match &error {
+            KalamError::Native { error_type, .. } => safe_native_message(error_type).to_owned(),
+            _ => error.to_string(),
+        };
+        let mut output = self.error(code, message);
         output.requires_review = code == ErrorCode::UnknownOutcome;
         output
     }
@@ -184,9 +188,10 @@ impl KalamSession {
                 "file exceeds signed native transfer size",
             ));
         }
-        // This durable barrier is written BEFORE USB dispatch, including SIGKILL.
+        // Persist native_dispatched=true while retaining Ready before USB.
+        // Save failure returns here; native.upload below must not be invoked.
         stage
-            .mark_needs_review("USB dispatch pending")
+            .mark_dispatched()
             .map_err(|error| self.local_error(&error))?;
         let request = SafeUploadRequest {
             storage_id,
@@ -603,6 +608,35 @@ impl KalamSession {
     }
 }
 
+/// Only inspected enum literals may enter a diagnostic message. Unknown types,
+/// native message text, and data never enter Display or the IPC error message.
+fn safe_native_message(error_type: &str) -> &'static str {
+    match error_type {
+        "ErrorMtpDetectFailed" => "native failure: ErrorMtpDetectFailed",
+        "ErrorMtpLockExists" => "native failure: ErrorMtpLockExists",
+        "ErrorDeviceChanged" => "native failure: ErrorDeviceChanged",
+        "ErrorDeviceSetup" => "native failure: ErrorDeviceSetup",
+        "ErrorMultipleDevice" => "native failure: ErrorMultipleDevice",
+        "ErrorAllowStorageAccess" => "native failure: ErrorAllowStorageAccess",
+        "ErrorDeviceLocked" => "native failure: ErrorDeviceLocked",
+        "ErrorDeviceInfo" => "native failure: ErrorDeviceInfo",
+        "ErrorStorageInfo" => "native failure: ErrorStorageInfo",
+        "ErrorNoStorage" => "native failure: ErrorNoStorage",
+        "ErrorStorageFull" => "native failure: ErrorStorageFull",
+        "ErrorListDirectory" => "native failure: ErrorListDirectory",
+        "ErrorFileNotFound" => "native failure: ErrorFileNotFound",
+        "ErrorFilePermission" => "native failure: ErrorFilePermission",
+        "ErrorLocalFileRead" => "native failure: ErrorLocalFileRead",
+        "ErrorInvalidPath" => "native failure: ErrorInvalidPath",
+        "ErrorFileTransfer" => "native failure: ErrorFileTransfer",
+        "ErrorFileObjectRead" => "native failure: ErrorFileObjectRead",
+        "ErrorSendObject" => "native failure: ErrorSendObject",
+        "ErrorGeneral" => "native failure: ErrorGeneral",
+        "ErrorNeedsReview" => "native failure: ErrorNeedsReview",
+        _ => "native failure: details withheld",
+    }
+}
+
 /// Stored only inside the private local journal, never in Display/UI error text.
 fn native_review_record(error: &KalamError) -> String {
     match error {
@@ -680,6 +714,56 @@ pub fn serve_kalam(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_categories_are_static_whitelist_literals_only() {
+        for (kind, expected) in [
+            ("ErrorDeviceSetup", "native failure: ErrorDeviceSetup"),
+            ("ErrorMtpLockExists", "native failure: ErrorMtpLockExists"),
+            ("ErrorListDirectory", "native failure: ErrorListDirectory"),
+        ] {
+            assert_eq!(safe_native_message(kind), expected);
+        }
+        for kind in [
+            "/private/device/file",
+            "ErrorDeviceSetup /private/device/file",
+            "ErrorMtpLockExists\nserial=private",
+            "UnknownNativeError",
+        ] {
+            assert_eq!(
+                safe_native_message(kind),
+                "native failure: details withheld"
+            );
+        }
+    }
+
+    #[test]
+    fn native_payload_details_never_enter_backend_error_message() {
+        let mut session = KalamSession {
+            load_error: None,
+            native: None,
+            generation: 7,
+            connected: true,
+            initialized: true,
+            storages: HashSet::new(),
+            objects: HashMap::new(),
+        };
+        for kind in [
+            "ErrorDeviceSetup",
+            "ErrorListDirectory",
+            "ErrorDeviceSetup /private/device/file",
+        ] {
+            let error = session.native_error(KalamError::Native {
+                error_type: kind.into(),
+                message: "/private/device/file serial=secret".into(),
+                data: Some(serde_json::json!({"path":"/private/device/file", "serial":"secret"})),
+            });
+            assert_eq!(error.message, safe_native_message(kind));
+            assert!(!error.message.contains("/private"));
+            assert!(!error.message.contains("secret"));
+            assert!(!error.session_usable);
+        }
+    }
+
     #[test]
     fn go_nil_slice_is_an_empty_directory() {
         assert_eq!(native_list(&Json::Null), Ok([].as_slice()));

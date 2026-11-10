@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
 
+mod inspect;
+pub use inspect::InspectUploadDestinationRequest;
 mod transfer;
 pub use transfer::{SafeDownloadRequest, SafeUploadPolicy, SafeUploadRequest};
 
@@ -64,6 +66,10 @@ pub enum KalamError {
         "Kalam FD transfer {operation} is unavailable; verified SafetyVersion 2 and its safe symbol are required"
     )]
     TransferUnavailable { operation: &'static str },
+    #[error(
+        "Kalam read-only destination inspection is unavailable; verified SafetyVersion 2 and its inspection symbol are required"
+    )]
+    InspectionUnavailable,
     #[error("Kalam native error (details withheld)")]
     Native {
         error_type: String,
@@ -206,6 +212,7 @@ struct Symbols {
     safety_version: Option<u32>,
     safe_upload: Option<SafeUpload>,
     safe_download: Option<SafeDownload>,
+    inspect_upload_destination: Option<WithInput>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -320,6 +327,14 @@ impl Kalam {
                 safe_download: if safety_version == Some(2) {
                     library
                         .get::<SafeDownload>(b"SafeDownloadSingle\0")
+                        .ok()
+                        .map(|symbol| *symbol)
+                } else {
+                    None
+                },
+                inspect_upload_destination: if safety_version == Some(2) {
+                    library
+                        .get::<WithInput>(b"InspectUploadDestination\0")
                         .ok()
                         .map(|symbol| *symbol)
                 } else {
@@ -695,6 +710,8 @@ fn validate_remote_path(path: &str) -> Result<()> {
 #[cfg(test)]
 static FREED_PAYLOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+mod inspect_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

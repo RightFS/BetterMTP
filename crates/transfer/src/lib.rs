@@ -166,8 +166,9 @@ pub struct Journal {
     pub publication_confirmed: bool,
     #[serde(default)]
     pub remote_upload: Option<RemoteUploadReceipt>,
-    /// Durable intent/evidence written before native download dispatch. It does
-    /// not authorize replay and may be true even if the native call never ran.
+    /// Durable intent/evidence written before native download/upload dispatch.
+    /// It does not authorize replay and may be true if the call never ran;
+    /// false in an older journal does not prove native/USB work never happened.
     #[serde(default)]
     pub native_dispatched: bool,
     pub failure: Option<String>,
@@ -906,9 +907,31 @@ impl UploadStage {
         &self.stage.journal
     }
 
+    /// Persist upload dispatch intent before entering native/USB code. Caller
+    /// must finish source/snapshot checks first. On success keep Ready so an
+    /// authorized current-call receipt can still be recorded by mark_uploaded.
+    /// On any save failure return an error and retain NeedsReview; do not call
+    /// native code. Existing dispatch evidence is never authority to replay.
+    pub fn mark_dispatched(&mut self) -> Result<()> {
+        if self.stage.journal.state != TaskState::Ready
+            || self.stage.journal.native_dispatched
+            || self.stage.journal.publication_confirmed
+            || self.stage.journal.remote_upload.is_some()
+            || self.stage.cleaned
+        {
+            return Err(TransferError::InvalidState(self.stage.journal.state));
+        }
+        self.stage.journal.native_dispatched = true;
+        let result = self.stage.save();
+        if let Err(error) = &result {
+            self.stage.failure(error);
+        }
+        result
+    }
+
     /// Record metadata from the worker's verified current native upload call.
-    /// The worker MUST persist dispatch-pending NeedsReview before USB work and
-    /// verify the receipt against that call; this type alone is not authorization.
+    /// The worker MUST successfully mark_dispatched before USB work and verify
+    /// the receipt against that call; this type alone is not authorization.
     /// No source recheck is required: the immutable captured snapshot was sent.
     /// On save/ownership failure retain the receipt and possible-publication
     /// evidence in live NeedsReview state; do not retry upload or delete objects.

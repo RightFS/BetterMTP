@@ -14,17 +14,22 @@ import (
 )
 
 type fakeUploadDevice struct {
-	info                               mtp.ObjectInfo
-	old                                map[uint32]string
-	sent                               bool
-	createErr, sendErr                 error
-	reused, wrongSize, wrongName, zero bool
-	globalReuse                        bool
-	parentReplaced                     bool
-	createCalled                       bool
+	info                                       mtp.ObjectInfo
+	old                                        map[uint32]string
+	sent                                       bool
+	createErr, sendErr                         error
+	reused, wrongSize, wrongName, zero         bool
+	globalReuse                                bool
+	parentReplaced                             bool
+	createCalled                               bool
+	parentErr, snapshotErr, existingHandlesErr error
+	snapshotAfterErr                           error
 }
 
 func (d *fakeUploadDevice) existingHandles() (map[uint32]bool, error) {
+	if d.existingHandlesErr != nil {
+		return nil, d.existingHandlesErr
+	}
 	out := map[uint32]bool{7: true}
 	if d.globalReuse {
 		out[99] = true
@@ -33,6 +38,9 @@ func (d *fakeUploadDevice) existingHandles() (map[uint32]bool, error) {
 }
 
 func (d *fakeUploadDevice) parent(storage uint32, destination string, originalID *uint32) (uint32, error) {
+	if d.parentErr != nil {
+		return 0, d.parentErr
+	}
 	resolvedID := uint32(42)
 	if d.parentReplaced {
 		resolvedID = 43
@@ -43,6 +51,12 @@ func (d *fakeUploadDevice) parent(storage uint32, destination string, originalID
 	return validateUploadParentIdentity(storage, originalID, destination, &mtpx.FileInfo{ObjectId: resolvedID, IsDir: true}, &mtp.ObjectInfo{StorageID: storage, ObjectFormat: mtp.OFC_Association})
 }
 func (d *fakeUploadDevice) snapshot(uint32, uint32) (map[uint32]string, error) {
+	if !d.sent && d.snapshotErr != nil {
+		return nil, d.snapshotErr
+	}
+	if d.sent && d.snapshotAfterErr != nil {
+		return nil, d.snapshotAfterErr
+	}
 	out := map[uint32]string{7: "original.txt"}
 	if d.old != nil {
 		for id, name := range d.old {

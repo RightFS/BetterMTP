@@ -120,3 +120,6 @@ void Dispose(on_cb_result_t *ptr) {
 #ifdef SAFETY_FD_V2
 #include "safe_fd.inc"
 #endif
+#ifdef SAFETY_INSPECT
+#include "inspect.inc"
+#endif

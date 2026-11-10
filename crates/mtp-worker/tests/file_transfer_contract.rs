@@ -160,6 +160,7 @@ fn fd_upload_snapshots_content_and_saves_verified_receipt_without_touching_sourc
     assert_eq!(fs::read(&source).unwrap(), b"payload");
     let journal = journal(&receipt.journal_path);
     assert_eq!(journal["state"], "Committed");
+    assert_eq!(journal["native_dispatched"], true);
     assert_eq!(journal["remote_upload"]["object_id"], 123);
     let payload = receipt
         .journal_path
@@ -187,6 +188,7 @@ fn captured_snapshot_upload_completes_even_if_original_changes_during_native_cal
     let record = journal(&receipt.journal_path);
     assert_eq!(record["state"], "Committed");
     assert_eq!(record["publication_confirmed"], true);
+    assert_eq!(record["native_dispatched"], true);
     assert!(record["failure"].is_null());
     let staged = receipt
         .journal_path
@@ -231,6 +233,7 @@ fn zero_byte_upload_and_download_are_real_verified_empty_results() {
         .upload_file(&source, "report.txt", &root, &fixture.dir("cache"))
         .unwrap();
     assert_eq!(uploaded.bytes, 0);
+    assert_eq!(journal(&uploaded.journal_path)["native_dispatched"], true);
     let downloaded = client
         .download_file(
             &remote.reference,
@@ -482,6 +485,7 @@ fn native_uncertainty_preserves_private_metadata_in_journal_not_display() {
     };
     let record = journal(&path);
     assert_eq!(record["state"], "NeedsReview");
+    assert_eq!(record["native_dispatched"], true);
     let metadata: serde_json::Value =
         serde_json::from_str(record["failure"].as_str().unwrap()).unwrap();
     assert_eq!(metadata["nativeError"]["data"]["objectId"], 123);
@@ -529,7 +533,12 @@ fn worker_death_during_upload_is_unknown_not_canceled_with_durable_dispatch_jour
         Err(ApplicationError::UnknownOutcome { .. })
     ));
     assert!(client.session().is_none());
-    assert_eq!(journals(&cache)[0]["state"], "NeedsReview");
+    let records = journals(&cache);
+    let record = &records[0];
+    // _exit skips Drop: Ready plus durable dispatch evidence still requires
+    // review and must not be interpreted as an undispatched/retryable task.
+    assert_eq!(record["state"], "Ready");
+    assert_eq!(record["native_dispatched"], true);
     assert_eq!(fs::read(source).unwrap(), b"payload");
 }
 

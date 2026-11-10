@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 mtp-backend-api.workspace = true
 mtp-local-fs.workspace = true
+mtp-application.workspace = true
+mtp-domain.workspace = true
 
 [lints]
 workspace = true

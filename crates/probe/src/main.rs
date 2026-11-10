@@ -228,6 +228,33 @@ fn fake_probe(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn kalam_probe(library_path: &Path, worker_path: &Path) -> Result<()> {
+    let mut client = mtp_application::WorkerClient::spawn(
+        worker_path,
+        &mtp_application::BackendConfig::Kalam {
+            library_path: library_path.to_owned(),
+        },
+    )?;
+    let info = client.connect()?;
+    println!("Connected: {} (real Kalam, read-only)", info.display_name);
+    let storages = client.storages()?;
+    require(!storages.is_empty(), "device has no accessible storage")?;
+    for storage in storages {
+        let entries = client.list(&info.root(mtp_domain::StorageId(storage.id)))?;
+        println!(
+            "Storage {}: {} — {} root entries",
+            storage.id,
+            storage.name,
+            entries.len()
+        );
+    }
+    client.shutdown()?;
+    println!(
+        "PASS: real device initialization, storage enumeration, root browsing and clean shutdown. No file was written or transferred."
+    );
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     match args.next().as_deref() {
@@ -241,6 +268,16 @@ fn run() -> Result<()> {
             };
             require(args.next().is_none(), "too many arguments")?;
             fake_probe(&path)
+        }
+        Some(mode) if mode == "kalam" => {
+            let library=args.next().map(PathBuf::from).ok_or_else(||io::Error::other("kalam requires an absolute library path"))?;
+            require(library.is_absolute(),"Kalam library path must be absolute")?;
+            let worker=match args.next() {
+                Some(path)=>PathBuf::from(path),
+                None=>std::env::current_exe()?.parent().ok_or_else(||io::Error::other("probe executable has no parent"))?.join("mtp-worker"),
+            };
+            require(args.next().is_none(),"too many arguments")?;
+            kalam_probe(&library,&worker)
         }
         Some(mode) if mode == "local" => {
             let path = args
@@ -262,7 +299,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         _ => {
-            Err(io::Error::other("Usage: mtp-probe fake [worker-path] | local <directory>").into())
+            Err(io::Error::other("Usage: mtp-probe fake [worker-path] | kalam <absolute-library> [worker-path] | local <directory>").into())
         }
     }
 }

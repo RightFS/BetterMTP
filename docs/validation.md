@@ -48,7 +48,7 @@ fake probe 成功完成握手、storage、Unicode/>4GiB **元数据**、重连�
 
 这是核心无 Node 的构建与运行证据，不是整个 GPUI/Go 过渡构建链或干净机发布验收。主机本来装有 Node，但此次命令不可访问它；没有冒充“主机完全未安装 Node”。
 
-## GPUI 构建尚未通过
+## 首轮 GPUI 构建失败记录（已于后续迭代解除）
 
 两次真实 `cargo check -p app-gpui --locked` 都退出 101：
 
@@ -74,3 +74,15 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo run --locked -p a
 ## CI 与发布
 
 [CI](../.github/workflows/ci.yml) 已配置 Linux/macOS core 与独立 macOS GPUI build gate；没有远程仓库或推送，因此没有远程 CI 运行结果。当前没有签名 app/DMG、Intel 发布验收、真实设备、大文件传输或性能结果。
+
+## 后续 MVP 迭代：原生浏览与安全本地事务
+
+后续安装 Metal Toolchain 成功，局部 `DEVELOPER_DIR` 下 `xcrun metal --version` 已返回 Apple Metal 32023.922 / 27B47。没有更改全局 xcode-select。以上首轮“尚未构建”仅为历史。
+
+实际 `cargo build -p app-gpui -p mtp-worker -p mtp-probe --locked` 退出 0，原生窗口已启动。CoreGraphics 查询到该进程可见窗口，尺寸 1100 × 732（含标题栏）；捕获该单窗口时 `screencapture` 返回 `could not create image from window`，没有绕过系统屏幕录制权限、没有伪造截图。因此窗口创建和 UI 单测已确认，完整视觉/IME/拖放/真实键鼠仍须 manual 验收。
+
+默认核心测试增至 **153 项通过**：原 95 项，加 C ABI contract 2 项（其 driver 覆盖 20 个独立进程场景）、Go nil-list 2 项、application/worker 5 项，以及本地 no-clobber staging 49 项。C ABI 的 ignored 子进程 driver 是由父测试显式运行的 helper，不是漏掉真实测试。GPUI 单测最初 10 项通过；后续 Finder 配置测试也纳入构建门禁，具体结果见本轮命令和提交记录。
+
+实际新编译 Go 库（arm64 / macOS 26.6）通过 worker 启动只读探针，得到明确 `ErrorMtpDetectFailed: no MTP devices found`，探针退出 1；系统 USB 列表也未看到 Android。这个结果证明真实 Go/C 过渡库能够在隔离 worker 加载并回传失败，不是设备/USB 传输通过，更没有 fake fallback。
+
+后续加固 FD 上传/下载 ABI、原子最终落盘、journal、`.app` local developer packaging 的独立证据分别见 [原生安全层](kalam-native-safety.md)、[本地事务](local-transfer-safety.md)、[本地打包](local-package.md)。未实际接线的能力不开放为可用按钮；签名/最低 OS/Intel/真机及上游再分发授权仍是发布门禁。

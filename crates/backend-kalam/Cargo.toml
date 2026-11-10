@@ -1,0 +1,20 @@
+[package]
+name = "mtp-backend-kalam"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+libloading = "=0.8.9"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+# This is the only native ABI boundary. Do not inherit the core's unsafe forbid.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

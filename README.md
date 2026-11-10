@@ -9,7 +9,9 @@ OpenMTP 重构的独立 Rust 工程。首版目标：移除 Electron / Chromium 
 - 领域引用、存储根目录、不可变复制快照、逐项/批次状态机。
 - 1 MiB 限额的版本化 IPC，显式 fake worker 和真实子进程合同测试。
 - 本地只读目录浏览；保留原始路径、不跟随 symlink 元数据。
-- GPUI 0.2.2 原生双空面板源码，**尚未通过编译/窗口运行验收**。
+- GPUI 0.2.2 双面板已通过构建并实际启动；后台本地浏览、虚拟列表、焦点/快捷键，以及显式 Kalam 连接、存储与目录浏览已接线。
+- 隔离的真实 Kalam 动态绑定和应用级会话 token；worker 重启不会复用旧条目引用。没有真实库配置时不自动回退 fake。
+- 当前界面只读，上传/下载仍在安全 FD ABI、原子落盘与真机验收阶段；窗口创建不等于 IME、拖放或设备传输验收。
 
 ```bash
 # 核心：格式化检查、单元/子进程测试、严格 clippy、fake probe
@@ -24,6 +26,12 @@ cargo run --locked -p mtp-probe -- fake
 # 需要真实可用的 Xcode Metal Toolchain
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer bash scripts/check.sh --ui
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo run --locked -p app-gpui
+
+# 同目录需要 mtp-worker；动态库为明确选定的本地编译产物
+# 仅设置真实 backend，不会偷偷切成 fake
+# Android 必须已解锁并切换到文件传输/MTP
+ target/debug/app-gpui --library /absolute/path/to/kalam.dylib
+ target/debug/mtp-probe kalam /absolute/path/to/kalam.dylib
 ```
 
 Cargo 不在 PATH 时先 `export PATH="$HOME/.cargo/bin:$PATH"`。初始开发机仅有名为 stable 的已安装工具链，但其实际版本为 1.99.1，因此本轮用 `RUSTUP_TOOLCHAIN=stable bash scripts/check.sh` 验证；脚本会核对实际 rustc 版本，不接受漂移。其他机器按固定 [toolchain](rust-toolchain.toml) 安装对应版本。脚本默认把 Cargo 缓存放工程内忽略目录，不更改系统包管理器。
@@ -39,9 +47,11 @@ Cargo 不在 PATH 时先 `export PATH="$HOME/.cargo/bin:$PATH"`。初始开发�
 - `domain`：设备/条目身份、任务状态和冲突安全规则，不依赖 UI/USB。
 - `backend-api`：有界、版本化 worker 通信；stdout 只承载协议。
 - `local-fs`：本地浏览，阻塞 IO 由调用方放后台执行。
-- `mtp-worker`：单会话 owner；初始 fake adapter，不执行用户文件写入。
-- `probe`：真实子进程端到端探针，验证握手、会话和错误行为。
-- `app-gpui`：原生窗口技术验证；核心测试不依赖 GPU 窗口环境。
+- `mtp-worker`：单会话 owner；显式 fake 与真实 Kalam adapter，目前只开放只读操作。
+- `backend-kalam`：只在 worker 加载可信 native 库；C callback 复制/释放与 stdout 隔离。
+- `application`：有 deadline 的 worker 客户端，app token 到 wire generation 的安全翻译。
+- `probe`：真实子进程端到端探针，区分模拟合同测试与真实设备读取。
+- `app-gpui`：真实原生双面板；界面测试使用 GPUI test context，不冒充 OS 交互或设备验证。
 
 ## 工具链
 

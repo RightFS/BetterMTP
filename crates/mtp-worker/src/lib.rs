@@ -2,6 +2,8 @@
 use mtp_backend_api::*;
 use std::io::{Read, Write};
 
+pub mod kalam;
+
 #[derive(Default)]
 pub struct FakeSession {
     generation: u64,

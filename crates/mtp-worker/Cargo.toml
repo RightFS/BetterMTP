@@ -7,6 +7,12 @@ license.workspace = true
 
 [dependencies]
 mtp-backend-api.workspace = true
+mtp-backend-kalam.workspace = true
+mtp-domain.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+mtp-application.workspace = true
 
 [lints]
 workspace = true

@@ -129,6 +129,9 @@ pub struct BackendError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
+    BackendFailure,
+    InvalidData,
+    Unsupported,
     NotConnected,
     AlreadyConnected,
     StaleSession,

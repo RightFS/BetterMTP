@@ -2,7 +2,33 @@
 
 OpenMTP 重构的独立 Rust 工程。首版目标：移除 Electron / Chromium / Node 的应用运行时及构建依赖，使用 GPUI 原生界面、Rust 应用层和隔离 worker；允许 Kalam（Go + libusb）作为过渡后端。
 
-原始方案：[Rust + GPUI 重构方案](../../docs/OpenMTP-Rust-GPUI-重构技术方案.md)（此链接仅在当前父工作区有效）。旧源码是回归参考，不作为本工程的 Node 构建依赖。
+原始方案：[Rust + GPUI 重构方案](../docs/OpenMTP-Rust-GPUI-重构技术方案.md)（此链接仅在当前父工作区有效）。旧源码是回归参考，不作为本工程的 Node 构建依赖。
+
+## 已有代码与运行方式
+
+- 领域引用、存储根目录、不可变复制快照、逐项/批次状态机。
+- 1 MiB 限额的版本化 IPC，显式 fake worker 和真实子进程合同测试。
+- 本地只读目录浏览；保留原始路径、不跟随 symlink 元数据。
+- GPUI 0.2.2 原生双空面板源码，**尚未通过编译/窗口运行验收**。
+
+```bash
+# 核心：格式化检查、单元/子进程测试、严格 clippy、fake probe
+bash scripts/check.sh
+
+# 本地浏览（上一步已生成二进制）
+target/debug/mtp-probe local /path/to/directory
+
+# 独立 fake worker 探针；没有 USB 或真实传输
+cargo run --locked -p mtp-probe -- fake
+
+# 需要真实可用的 Xcode Metal Toolchain
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer bash scripts/check.sh --ui
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo run --locked -p app-gpui
+```
+
+Cargo 不在 PATH 时先 `export PATH="$HOME/.cargo/bin:$PATH"`。初始开发机仅有名为 stable 的已安装工具链，但其实际版本为 1.99.1，因此本轮用 `RUSTUP_TOOLCHAIN=stable bash scripts/check.sh` 验证；脚本会核对实际 rustc 版本，不接受漂移。其他机器按固定 [toolchain](rust-toolchain.toml) 安装对应版本。脚本默认把 Cargo 缓存放工程内忽略目录，不更改系统包管理器。
+
+详细证据与未完成项：[验证记录](docs/validation.md)、[GPUI PoC](docs/gpui-poc.md)、[Kalam 接入门禁](docs/kalam-integration.md)、[阶段计划](docs/roadmap.md)。
 
 ## 开发状态
 

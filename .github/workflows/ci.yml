@@ -1,0 +1,39 @@
+name: native-core
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+      - name: Verify native core without Node build tooling
+        run: bash scripts/check.sh
+
+  gpui-build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+      - name: Verify real Metal compiler
+        run: |
+          xcodebuild -version
+          xcrun metal --version
+      - name: Build native GPUI shell
+        run: |
+          cargo check --locked -p app-gpui
+          cargo build --locked -p app-gpui
+      # Deliberately not continue-on-error: missing Metal is a failed UI gate,
+      # not evidence that an uncompiled shell is a working application.
